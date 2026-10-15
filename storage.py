@@ -2,14 +2,64 @@
 from __future__ import annotations
 
 import sqlite3
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 class Store:
     def __init__(self, path: str):
         self.path = str(Path(path))
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._backup_before_migration()
         self.init_db()
+
+    def make_backup(self) -> Path:
+        """Consistent hot snapshot; does not alter or move live SQLite."""
+        source = Path(self.path)
+        backup_dir = source.parent / 'backups'
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+        destination = backup_dir / f'{source.stem}.manual_{timestamp}.sqlite3'
+        try:
+            with self.connect() as db, sqlite3.connect(destination) as target:
+                db.backup(target)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        return destination
+
+    def _backup_before_migration(self):
+        """Snapshot pre-v0.4 SQLite including WAL before adding a search index.
+
+        Never delete the source or auto-purge backups. If a snapshot fails,
+        refuse migration rather than silently risk losing a long-running story.
+        """
+        source = Path(self.path)
+        if not source.exists() or source.stat().st_size == 0:
+            return
+        with self.connect() as db:
+            user_version = db.execute('PRAGMA user_version').fetchone()[0]
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if not tables or user_version >= 4:
+                return
+            check = db.execute('PRAGMA quick_check').fetchone()[0]
+            if check != 'ok':
+                raise RuntimeError('SQLite database is not healthy; migration cancelled: ' + str(check))
+            backup_dir = source.parent / 'backups'
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+            destination = backup_dir / f'{source.stem}.before_v04_{stamp}.sqlite3'
+            try:
+                with sqlite3.connect(destination) as target:
+                    db.backup(target)
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+            log.warning('Created pre-migration SQLite backup: %s', destination)
 
     def connect(self):
         db = sqlite3.connect(self.path)
@@ -104,7 +154,127 @@ class Store:
                     session_id INTEGER NOT NULL REFERENCES sessions(id),
                     text TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS prompt_audit (
+                    session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+                    stage TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_text TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS style_examples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
             ''')
+            self._ensure_fts(db)
+            db.execute('PRAGMA user_version=4')
+
+    def _ensure_fts(self, db):
+        """Indexed search of old turns. Gracefully degrade if SQLite lacks FTS5."""
+        try:
+            present = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns_fts'").fetchone()
+            db.executescript("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+                    user_text, bot_text, content='turns', content_rowid='id', tokenize='unicode61'
+                );
+                CREATE TRIGGER IF NOT EXISTS turns_search_insert AFTER INSERT ON turns BEGIN
+                    INSERT INTO turns_fts(rowid, user_text, bot_text)
+                    VALUES(new.id, new.user_text, new.bot_text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS turns_search_delete AFTER DELETE ON turns BEGIN
+                    INSERT INTO turns_fts(turns_fts, rowid, user_text, bot_text)
+                    VALUES('delete', old.id, old.user_text, old.bot_text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS turns_search_update AFTER UPDATE ON turns BEGIN
+                    INSERT INTO turns_fts(turns_fts, rowid, user_text, bot_text)
+                    VALUES('delete', old.id, old.user_text, old.bot_text);
+                    INSERT INTO turns_fts(rowid, user_text, bot_text)
+                    VALUES(new.id, new.user_text, new.bot_text);
+                END;
+            """)
+            if not present:
+                db.execute("INSERT INTO turns_fts(turns_fts) VALUES('rebuild')")
+        except sqlite3.OperationalError as exc:
+            log.warning('FTS5 is unavailable; will use a capped lexical fallback: %s', exc)
+
+    def search_turns(self, sid: int, query: str, *, exclude_ids=(), limit: int = 3):
+        """Find story-local OLD turns; never fall back to turns from another session.
+
+        Search index contains no embeddings, making this usable without extra API
+        cost; Russian inflections remain an acknowledged limitation.
+        """
+        import re
+        from memory import tokens
+        wanted = [w for w in sorted(tokens(query), key=len, reverse=True) if len(w) >= 5][:14]
+        if not wanted or limit < 1:
+            return []
+        excluded = set(int(item) for item in exclude_ids)
+        rows = []
+        with self.connect() as db:
+            try:
+                match = ' OR '.join(f'{w}*' for w in wanted)
+                rows = db.execute("""
+                    SELECT t.* FROM turns_fts
+                    JOIN turns t ON t.id=turns_fts.rowid
+                    WHERE turns_fts MATCH ? AND t.session_id=?
+                    ORDER BY bm25(turns_fts) ASC LIMIT 150
+                """, (match, sid)).fetchall()
+            except sqlite3.OperationalError as exc:
+                log.debug('FTS search fell back to lexical scanning: %s', exc)
+            if not rows:
+                rows = db.execute(
+                    'SELECT * FROM turns WHERE session_id=? ORDER BY id DESC LIMIT 800', (sid,)
+                ).fetchall()
+        wanted_set = set(wanted)
+        scored = []
+        for row in rows:
+            if row['id'] in excluded:
+                continue
+            text = row['user_text'] + '\n' + row['bot_text']
+            terms = tokens(text)
+            overlap = sum(2 if w in terms else 1 if any(term.startswith(w[:6]) for term in terms) else 0
+                          for w in wanted_set)
+            if overlap == 0:
+                continue
+            scored.append((overlap, row['id'], row))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [row for _, _, row in scored[:min(5, limit)]]
+
+    def add_style_example(self, user_id: int, text: str):
+        text = text.strip()
+        if not 50 <= len(text) <= 5500:
+            raise ValueError('Style example must contain 50 to 5500 characters')
+        with self.connect() as db:
+            count = db.execute('SELECT COUNT(*) FROM style_examples WHERE user_id=?', (user_id,)).fetchone()[0]
+            if count >= 15:
+                raise ValueError('Maximum of 15 style examples')
+            return db.execute('INSERT INTO style_examples(user_id,text) VALUES (?,?)',
+                              (user_id, text)).lastrowid
+
+    def list_style_examples(self, user_id: int | None = None):
+        with self.connect() as db:
+            if user_id is None:
+                return db.execute('SELECT * FROM style_examples ORDER BY id DESC').fetchall()
+            return db.execute('SELECT * FROM style_examples WHERE user_id=? ORDER BY id DESC',
+                              (user_id,)).fetchall()
+
+    def delete_style_example(self, user_id: int, example_id: int):
+        with self.connect() as db:
+            return db.execute('DELETE FROM style_examples WHERE id=? AND user_id=?',
+                              (example_id, user_id)).rowcount > 0
+
+    def save_prompt_audit(self, sid: int, stage: str, model: str, text: str):
+        with self.connect() as db:
+            db.execute("""INSERT INTO prompt_audit(session_id,stage,model,prompt_text)
+                VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+                stage=excluded.stage,model=excluded.model,prompt_text=excluded.prompt_text,
+                updated_at=CURRENT_TIMESTAMP""", (sid, stage, model, text))
+
+    def get_prompt_audit(self, sid: int):
+        with self.connect() as db:
+            return db.execute('SELECT * FROM prompt_audit WHERE session_id=?', (sid,)).fetchone()
 
     def new_session(self, user_id: int, title: str):
         with self.connect() as db:
@@ -126,6 +296,19 @@ class Store:
         with self.connect() as db:
             return db.execute("SELECT s.* FROM activity a JOIN sessions s ON s.id=a.session_id "
                               "WHERE a.user_id=?", (user_id,)).fetchone()
+
+    def ensure_current_session(self, user_id: int):
+        """Restore an existing story if the active-story pointer was lost."""
+        session = self.current_session(user_id)
+        if session is not None:
+            return session
+        existing = self.list_sessions()
+        if existing:
+            sid = existing[0]['id']
+            self.switch_session(user_id, sid)
+            return self.get_session(sid)
+        sid = self.new_session(user_id, 'Свободная история')
+        return self.get_session(sid)
 
     def switch_session(self, user_id: int, sid: int):
         if not self.get_session(sid):

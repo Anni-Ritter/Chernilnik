@@ -1,3 +1,5 @@
+**CURRENT VERSION v0.4**: Read `MIGRATION_v04.md` first. The rest of this file contains historical setup notes for earlier versions.
+
 # Bothost deployment guide
 
 This package has flat top-level files to support Git deployment or direct archive deployment.
@@ -52,3 +54,8 @@ If the bot is not responding: check deploy logs for missing env variables, Pytho
 После перезапуска отправь `/start`, нажми `👤 Персонажи` → `➕ Новый персонаж` → укажи имя и роль → `➕ Фото`; отправь изображение. Дождись описания внешности; открой карточку и проверь его. Проверяй логи если бот пишет «анализ не удался».
 
 Схема SQLite расширяется автоматически: старые таблицы `sessions`, `turns`, `facts`, `openings` не пересоздаются; добавляются `characters` и `character_photos`. Ролевые посты и память останутся на месте **при условии, что путь к существующей SQLite БД остался тем же**. Сделай резервную копию `/app/data` перед обновлением.
+
+
+## v0.3.2 IMPORTANT
+
+Before upgrading, read `DB_RECOVERY.md` and back up `/app/data`. The bot now fails with a clear error instead of creating a new database if an existing BotHost SQLite file cannot be found. Set `DATABASE_PATH=/app/data/roleplay.sqlite3` explicitly in the BotHost environment.

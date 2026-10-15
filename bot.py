@@ -8,12 +8,13 @@ import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, FSInputFile, Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from engine import RoleplayEngine
 from storage import Store
+from db_safety import resolve_database_path
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +25,8 @@ API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
 OWNER = int(os.getenv('OWNER_TELEGRAM_ID') or 0)
 MODEL = os.getenv('OPENAI_MODEL', 'gpt-6-luna')
 MEMORY_MODEL = os.getenv('MEMORY_MODEL', 'gpt-6-luna')
-DB_PATH = os.getenv('DATABASE_PATH', '/app/data/roleplay.sqlite3' if os.path.isdir('/app/data') else 'roleplay.sqlite3')
+DB_PATH = resolve_database_path(allow_new=os.getenv('ALLOW_NEW_DATABASE', '').lower() in ('1', 'true', 'yes'))
+log.info('Using SQLite database: %s', DB_PATH)
 AUTO_MEMORY = os.getenv('AUTO_MEMORY', 'true').lower() in ('1', 'true', 'yes', 'on')
 MAX_OUTPUT = int(os.getenv('MAX_OUTPUT_TOKENS', '1800'))
 
@@ -54,6 +56,8 @@ HELP = (
     '/last — повторно показать последний ответ (тех. восстановление)\n'
     '/export — скачать историю в Markdown\n'
     '/status — состояние и расход токенов\n'
+    '/prompt — показать последний запрос к модели (без генерации)\n'
+    '/backup — скачать резервную копию SQLite\n'
     '/id — узнать свой Telegram ID\n\n'
     'Бот не перегенерирует игровые события. Каждый успешный ответ сразу становится ходом истории.'
 )
@@ -71,11 +75,7 @@ async def ensure_access(message: Message) -> bool:
 
 
 def current(user_id: int):
-    session = db.current_session(user_id)
-    if session is None:
-        sid = db.new_session(user_id, 'Свободная история')
-        session = db.get_session(sid)
-    return session
+    return db.ensure_current_session(user_id)
 
 
 def begin_keyboard(sid: int):
@@ -242,6 +242,36 @@ async def cmd_status(message: Message):
                          f'Модель: {MODEL}; память: {MEMORY_MODEL}\n'
                          f'Токены генерации: вход {usage_in}, выход {usage_out}.\n'
                          f'Токены памяти: вход {memory_in}, выход {memory_out}.')
+
+
+@router.message(Command('prompt'))
+async def cmd_prompt(message: Message):
+    if not await ensure_access(message):
+        return
+    sid = current(message.from_user.id)['id']
+    record = db.get_prompt_audit(sid)
+    if record is None:
+        await message.answer('Отладочный запрос ещё не записан. После следующей генерации '
+                             'он появится здесь, если PROMPT_DEBUG=true.')
+        return
+    content = record['prompt_text'].encode('utf-8')
+    await message.answer_document(
+        BufferedInputFile(content, filename=f'prompt_story_{sid}.txt'),
+        caption='Последний запрос к модели для этой истории. Содержит приватный канон и тайны героев.'
+    )
+
+
+@router.message(Command('backup'))
+async def cmd_backup(message: Message):
+    if not await ensure_access(message):
+        return
+    try:
+        path = db.make_backup()
+        await message.answer_document(FSInputFile(str(path)),
+            caption='Резервная копия SQLite. Фото-референсы нужно сохранять отдельно из /app/data/portraits.')
+    except Exception:
+        log.exception('Manual backup failed')
+        await message.answer('Не удалось сделать или отправить резервную копию. Проверь логи и свободное место BotHost.')
 
 
 @router.message(Command('last'))

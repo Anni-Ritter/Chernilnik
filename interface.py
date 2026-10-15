@@ -29,6 +29,7 @@ class Editing(StatesGroup):
     character_appearance = State()
     photo = State()
     pinned_fact = State()
+    style_example = State()
 
 
 DRAFT_KEYS = ReplyKeyboardMarkup(keyboard=[
@@ -56,8 +57,10 @@ def main_menu():
     return keyboard([
         [('📖 Истории', 'ui:sessions'), ('👤 Персонажи', 'ui:characters')],
         [('🌍 Мир и сцена', 'ui:scene'), ('🧠 Память', 'ui:memory')],
+        [('🎨 Стиль и примеры', 'ui:style')],
         [('✒️ Первый пост', 'ui:begin'), ('📝 Длинный пост', 'ui:draft')],
         [('📦 Экспорт', 'ui:export'), ('📊 Статус', 'ui:status')],
+        [('🔎 Промпт к модели', 'ui:prompt'), ('💾 Копия базы', 'ui:backup')],
     ])
 
 
@@ -92,11 +95,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         return bool(user and user.id == owner and chat and chat.type == 'private')
 
     def active(user_id):
-        session = db.current_session(user_id)
-        if session is None:
-            sid = db.new_session(user_id, 'Свободная история')
-            return db.get_session(sid)
-        return session
+        return db.ensure_current_session(user_id)
 
     def active_char(cid, user_id):
         char = db.get_character(cid)
@@ -116,6 +115,20 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             rows.append([(('✅ ' if s['id'] == active_id else '📖 ') + title, f'ui:session:{s["id"]}')])
         rows.append([('← Меню', 'ui:home')])
         await message.answer('📖 Истории · выбери существующую или создай новую.', reply_markup=keyboard(rows))
+
+    async def show_style(message: Message, user_id: int):
+        examples = db.list_style_examples(user_id)
+        rows = [[('➕ Добавить образец поста', 'ui:styleadd')]]
+        for record in examples[:15]:
+            label = '📝 #' + str(record['id']) + ' ' + record['text'][:26].replace('\n', ' ')
+            rows.append([(label, f'ui:styleitem:{record["id"]}')])
+        rows.append([('← Меню', 'ui:home')])
+        await message.answer('🎨 Литературный стиль\n\n'
+                             'Образцы действуют во ВСЕХ твоих историях, но не являются их каноном.\n'
+                             f'Сохранено твоих примеров: {len(examples)}/15.\n'
+                             'Чернильник подставит до двух подходящих примеров при генерации.\n'
+                             'Их можно добавлять прямо сюда, без новых деплоев.',
+                             reply_markup=keyboard(rows))
 
     async def show_characters(message: Message, user_id: int):
         sid = active(user_id)['id']
@@ -270,6 +283,32 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             await state.clear()
         if action == 'home':
             await show_menu(message, uid)
+        elif action == 'style':
+            await show_style(message, uid)
+        elif action == 'styleadd':
+            if len(db.list_style_examples(uid)) >= 15:
+                await message.answer('Уже 15 примеров. Удали ненужный, прежде чем добавить новый.')
+            else:
+                await state.set_state(Editing.style_example)
+                await message.answer('🎨 Отправь одним сообщением удачный литературный пост '
+                                     '(50–5500 символов). Это НЕ ролевой ход, он не изменит сюжет. '
+                                     'Для отмены нажми «🗂 Меню».')
+        elif action == 'styleitem' and arg.isdigit():
+            item = next((x for x in db.list_style_examples(uid) if x['id'] == int(arg)), None)
+            if item:
+                await message.answer(f'🎨 Образец #{item["id"]}:\n\n{item["text"][:3000]}',
+                                     reply_markup=keyboard([
+                                         [('🗑 Удалить образец', f'ui:styledelask:{arg}')],
+                                         [('← Стиль', 'ui:style')],
+                                     ]))
+        elif action == 'styledelask' and arg.isdigit():
+            await message.answer('Удалить этот образец стиля?', reply_markup=keyboard([
+                [('Да, удалить', f'ui:styledelyes:{arg}')],
+                [('Нет', 'ui:style')],
+            ]))
+        elif action == 'styledelyes' and arg.isdigit():
+            db.delete_style_example(uid, int(arg))
+            await show_style(message, uid)
         elif action == 'sessions':
             await show_sessions(message, uid)
         elif action == 'new':
@@ -426,6 +465,25 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             sid = active(uid)['id']
             await message.answer_document(BufferedInputFile(db.export(sid).encode('utf-8'),
                                                            filename=f'roleplay_{sid}.md'))
+        elif action == 'prompt':
+            sid = active(uid)['id']
+            trace = db.get_prompt_audit(sid)
+            if trace is None:
+                await message.answer('Промпт ещё не записан. Проведи один ход; PROMPT_DEBUG должен быть true.')
+            else:
+                await message.answer_document(
+                    BufferedInputFile(trace['prompt_text'].encode('utf-8'),
+                                      filename=f'prompt_story_{sid}.txt'),
+                    caption='Последний реальный запрос к модели. Содержит секреты персонажей.')
+        elif action == 'backup':
+            try:
+                path = db.make_backup()
+                from aiogram.types import FSInputFile
+                await message.answer_document(FSInputFile(str(path)),
+                    caption='Резервная копия SQLite. Фото остаются отдельно в /app/data/portraits.')
+            except Exception:
+                log.exception('Manual backup failed')
+                await message.answer('Не удалось сделать копию базы. Проверь логи и место на диске.')
         elif action == 'status':
             sid = active(uid)['id']
             turns = db.recent_turns(sid, 999999)
@@ -531,6 +589,19 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
     @router.message(Editing.character_appearance, F.text)
     async def receive_look(message: Message, state: FSMContext):
         await receive_char_text(message, state, 'appearance_override')
+
+    @router.message(Editing.style_example, F.text)
+    async def receive_style_example(message: Message, state: FSMContext):
+        if not authorized_id(message.from_user, message.chat):
+            return
+        try:
+            db.add_style_example(message.from_user.id, message.text or '')
+        except ValueError as exc:
+            await message.answer('Не удалось сохранить пример: ' + str(exc))
+            return
+        await state.clear()
+        await message.answer('✅ Литературный образец сохранён, не как ролевое событие.',
+                             reply_markup=keyboard([[('🎨 Вернуться к стилю', 'ui:style')]]))
 
     @router.message(Editing.pinned_fact, F.text)
     async def receive_fact(message: Message, state: FSMContext):
