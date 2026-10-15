@@ -59,3 +59,14 @@ If the bot is not responding: check deploy logs for missing env variables, Pytho
 ## v0.3.2 IMPORTANT
 
 Before upgrading, read `DB_RECOVERY.md` and back up `/app/data`. The bot now fails with a clear error instead of creating a new database if an existing BotHost SQLite file cannot be found. Set `DATABASE_PATH=/app/data/roleplay.sqlite3` explicitly in the BotHost environment.
+
+
+## Обновление v0.5 (через GitHub / BotHost Pro)
+
+1. Сначала в Telegram отправьте `/backup` и скачайте базу. Убедитесь, что `DATABASE_PATH=/app/data/roleplay.sqlite3`.
+2. Скопируйте все файлы патча в **корень** проекта, включая новый `generation_models.py`. Не удаляйте `db_safety.py`, SQLite и `/app/data/portraits`.
+3. В переменных окружения BotHost добавьте `POLZA_API_KEY`. Сохраните прежние `OPENAI_API_KEY`, `MEMORY_MODEL` и `VISION_MODEL`.
+4. Обновите проект и перезапустите процесс, затем откройте Telegram: **Меню → Модель текста** либо `/model`.
+5. Убедитесь, что выбрано `polza · google/gemini-3.7-flash` и попробуйте **новую тестовую** историю. Старые истории не будут переписаны.
+
+**Важно:** `GENERATION_MODEL_CONFIG` по умолчанию находится рядом с SQLite: `/app/data/generation_model.json`. Это отдельный маленький файл с ID выбранной модели, **не** ключом. SQLite-схема не изменяется. Если после перезапуска модель сбросилась, проверьте сохранность этого файла и доступ на запись в `/app/data`.

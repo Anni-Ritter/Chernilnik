@@ -15,6 +15,7 @@ from openai import AsyncOpenAI
 from engine import RoleplayEngine
 from storage import Store
 from db_safety import resolve_database_path
+from generation_models import GenerationSettings, POLZA_BASE_URL, DEFAULT_POLZA_MODEL
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +23,7 @@ log = logging.getLogger(__name__)
 
 TOKEN = os.getenv('BOT_TOKEN', '').strip()
 API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
+POLZA_KEY = os.getenv('POLZA_API_KEY', '').strip()
 OWNER = int(os.getenv('OWNER_TELEGRAM_ID') or 0)
 MODEL = os.getenv('OPENAI_MODEL', 'gpt-6-luna')
 MEMORY_MODEL = os.getenv('MEMORY_MODEL', 'gpt-6-luna')
@@ -32,8 +34,18 @@ MAX_OUTPUT = int(os.getenv('MAX_OUTPUT_TOKENS', '1800'))
 
 router = Router()
 db = Store(DB_PATH)
-engine = RoleplayEngine(db, AsyncOpenAI(api_key=API_KEY or 'missing-api-key'),
-                        MODEL, MEMORY_MODEL, AUTO_MEMORY, MAX_OUTPUT)
+openai_client = AsyncOpenAI(api_key=API_KEY or 'missing-api-key')
+engine = RoleplayEngine(db, openai_client, MODEL, MEMORY_MODEL, AUTO_MEMORY, MAX_OUTPUT)
+model_settings = GenerationSettings(
+    os.getenv('GENERATION_MODEL_CONFIG') or os.path.join(os.path.dirname(DB_PATH), 'generation_model.json'),
+    openai_model=MODEL,
+    default_provider=os.getenv('GENERATION_PROVIDER', 'polza').strip().lower(),
+    default_model=os.getenv('GENERATION_MODEL', DEFAULT_POLZA_MODEL).strip(),
+)
+polza_client = (AsyncOpenAI(api_key=POLZA_KEY,
+                           base_url=os.getenv('POLZA_BASE_URL', POLZA_BASE_URL))
+                if POLZA_KEY else None)
+engine.configure_generation(model_settings, polza_client)
 story_lock = asyncio.Lock()
 
 HELP = (
@@ -57,6 +69,7 @@ HELP = (
     '/export — скачать историю в Markdown\n'
     '/status — состояние и расход токенов\n'
     '/prompt — показать последний запрос к модели (без генерации)\n'
+    '/model — выбрать модель литературных постов\n'
     '/backup — скачать резервную копию SQLite\n'
     '/id — узнать свой Telegram ID\n\n'
     'Бот не перегенерирует игровые события. Каждый успешный ответ сразу становится ходом истории.'
@@ -223,6 +236,14 @@ async def cmd_memory(message: Message):
     await send_long(message, '\n\n'.join(lines) + (f'\n\n…ещё {len(rows) - 22} записей' if len(rows) > 22 else ''))
 
 
+@router.message(Command('model'))
+async def cmd_model(message: Message):
+    if not await ensure_access(message):
+        return
+    from interface import model_menu_text, model_menu
+    await message.answer(model_menu_text(engine), reply_markup=model_menu(engine))
+
+
 @router.message(Command('status'))
 async def cmd_status(message: Message):
     if not await ensure_access(message):
@@ -239,7 +260,7 @@ async def cmd_status(message: Message):
                          f'Ходов: {len(turns)}; первый пост: {"есть" if opening else "нет"}\n'
                          f'Фактов: {len(db.list_facts(session["id"], 999999))}\n'
                          f'Время: {session["scene_time"] or "не задано"}\n'
-                         f'Модель: {MODEL}; память: {MEMORY_MODEL}\n'
+                         f'Модель текста: {engine.generation_choice().display()}; память: OpenAI/{MEMORY_MODEL}\n'
                          f'Токены генерации: вход {usage_in}, выход {usage_out}.\n'
                          f'Токены памяти: вход {memory_in}, выход {memory_out}.')
 
@@ -316,7 +337,7 @@ async def start_story(message: Message, user_id: int, requested_sid=None):
         await message.bot.send_chat_action(message.chat.id, 'typing')
         try:
             opening, inp, out = await engine.generate_opening(sid)
-            db.add_opening(sid, opening, MODEL, inp, out)
+            db.add_opening(sid, opening, engine.last_generation_model, inp, out)
         except Exception:
             log.exception('Opening generation or persistence failed')
             await message.answer('Не удалось начать историю. Начальный пост не сохранён; '
@@ -397,7 +418,7 @@ async def play(message: Message, post: str, user_id: int | None = None):
             await message.answer('Не удалось получить ответ от API. Ход не сохранён; '
                                  'сообщение можно отправить повторно. Проверь лог сервера и баланс API.')
             return False
-        turn_id = db.add_turn(session['id'], post, answer, MODEL, inp, out)
+        turn_id = db.add_turn(session['id'], post, answer, engine.last_generation_model, inp, out)
         try:
             await send_long(message, answer)
         except Exception:

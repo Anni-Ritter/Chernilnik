@@ -30,6 +30,7 @@ class Editing(StatesGroup):
     photo = State()
     pinned_fact = State()
     style_example = State()
+    custom_polza_model = State()
 
 
 DRAFT_KEYS = ReplyKeyboardMarkup(keyboard=[
@@ -57,11 +58,38 @@ def main_menu():
     return keyboard([
         [('📖 Истории', 'ui:sessions'), ('👤 Персонажи', 'ui:characters')],
         [('🌍 Мир и сцена', 'ui:scene'), ('🧠 Память', 'ui:memory')],
-        [('🎨 Стиль и примеры', 'ui:style')],
+        [('🎨 Стиль и примеры', 'ui:style'), ('🤖 Модель текста', 'ui:model')],
         [('✒️ Первый пост', 'ui:begin'), ('📝 Длинный пост', 'ui:draft')],
         [('📦 Экспорт', 'ui:export'), ('📊 Статус', 'ui:status')],
         [('🔎 Промпт к модели', 'ui:prompt'), ('💾 Копия базы', 'ui:backup')],
     ])
+
+
+def model_menu_text(engine):
+    choice = engine.generation_choice()
+    key_ok = engine.polza_client is not None
+    return (f'🤖 Модель литературных постов\n\nСейчас: {choice.display()}\n'
+            f'Polza API: {"ключ подключён" if key_ok else "нет POLZA_API_KEY"}\n\n'
+            'Память и анализ фото по-прежнему работают через OpenAI. '
+            'Переключение не меняет историю, SQLite или уже написанные посты. '
+            'Модель меняется только для следующих генераций.\n'
+            'Стоимость и ограничения зависят от Polza и выбранной модели.')
+
+
+def model_menu(engine):
+    choice = engine.generation_choice()
+    presets = [
+        ('gemini37', 'Polza · Gemini 3.7 Flash', 'polza', 'google/gemini-3.7-flash'),
+        ('gemini38', 'Polza · Gemini 3.8 Flash', 'polza', 'google/gemini-3.8-flash'),
+        ('openai', 'OpenAI · ' + engine.model, 'openai', engine.model),
+    ]
+    rows = []
+    for code, label, provider, model in presets:
+        selected = '✅ ' if (choice.provider, choice.model) == (provider, model) else ''
+        rows.append([(selected + label, f'ui:modelpick:{code}')])
+    rows.append([('✏️ Ввести другой ID модели Polza', 'ui:modelcustom')])
+    rows.append([('← Меню', 'ui:home')])
+    return keyboard(rows)
 
 
 def scene_menu():
@@ -283,6 +311,30 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             await state.clear()
         if action == 'home':
             await show_menu(message, uid)
+        elif action == 'model':
+            await message.answer(model_menu_text(engine), reply_markup=model_menu(engine))
+        elif action == 'modelpick':
+            choices = {
+                'gemini37': ('polza', 'google/gemini-3.7-flash'),
+                'gemini38': ('polza', 'google/gemini-3.8-flash'),
+                'openai': ('openai', engine.model),
+            }
+            if arg in choices:
+                try:
+                    choice = engine.select_generation_model(*choices[arg])
+                except (ValueError, OSError) as exc:
+                    await message.answer(str(exc), reply_markup=model_menu(engine))
+                else:
+                    await message.answer(f'✅ Выбрано: {choice.display()}. Следующий пост будет на этой модели.',
+                                         reply_markup=model_menu(engine))
+        elif action == 'modelcustom':
+            if engine.polza_client is None:
+                await message.answer('Сначала добавь POLZA_API_KEY в переменные BotHost и перезапусти бот.')
+            else:
+                await state.set_state(Editing.custom_polza_model)
+                await message.answer('Пришли точный ID модели из каталога Polza, например: '
+                                     'google/gemini-3.7-flash\n'
+                                     'Для отмены нажми «🗂 Меню».')
         elif action == 'style':
             await show_style(message, uid)
         elif action == 'styleadd':
@@ -496,6 +548,18 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
                                  f'Первый пост: {"есть" if opening else "нет"}\n'
                                  f'Дополнительных вызовов памяти/зрения: '
                                  f'{sum(r["input_tokens"] + r["output_tokens"] for r in uses)} токенов')
+
+    @router.message(Editing.custom_polza_model, F.text)
+    async def receive_custom_model(message: Message, state: FSMContext):
+        if not authorized_id(message.from_user, message.chat):
+            return
+        try:
+            choice = engine.select_generation_model('polza', (message.text or '').strip())
+        except (ValueError, OSError) as exc:
+            await message.answer(str(exc) + '\nПришли правильный ID или нажми «🗂 Меню».')
+            return
+        await state.clear()
+        await message.answer(f'✅ Выбрано: {choice.display()}.', reply_markup=model_menu(engine))
 
     @router.message(Editing.story_title, F.text)
     async def receive_title(message: Message, state: FSMContext):
