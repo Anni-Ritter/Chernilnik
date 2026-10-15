@@ -31,6 +31,14 @@ class Store:
                     current_location TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS openings (
+                    session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+                    bot_text TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS turns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL REFERENCES sessions(id),
@@ -112,6 +120,18 @@ class Store:
         with self.connect() as db:
             db.execute(f'UPDATE sessions SET {field}=? WHERE id=?', (value, sid))
 
+    def get_opening(self, sid: int):
+        with self.connect() as db:
+            return db.execute('SELECT * FROM openings WHERE session_id=?', (sid,)).fetchone()
+
+    def add_opening(self, sid: int, bot_text: str, model: str, in_tokens: int, out_tokens: int):
+        """One and only one opening per story: no rerolls, even after bot restarts."""
+        with self.connect() as db:
+            cursor = db.execute('INSERT OR IGNORE INTO openings(session_id,bot_text,model,input_tokens,output_tokens) '
+                                'VALUES (?,?,?,?,?)', (sid, bot_text, model, in_tokens, out_tokens))
+            if cursor.rowcount != 1:
+                raise ValueError('The opening already exists')
+
     def add_turn(self, sid: int, user_text: str, bot_text: str, model: str, in_tokens: int, out_tokens: int):
         with self.connect() as db:
             cur = db.execute("INSERT INTO turns(session_id,user_text,bot_text,model,input_tokens,output_tokens) "
@@ -182,6 +202,9 @@ class Store:
             rows = db.execute("SELECT * FROM turns WHERE session_id=? ORDER BY id", (sid,)).fetchall()
         output = [f"# {session['title']}", f"\n**Мир:** {session['world'] or 'Свободная ролевая'}",
                   f"\n**Роли:** {session['cast'] or 'Не установлены'}", ""]
+        opening = self.get_opening(sid)
+        if opening:
+            output.extend(['## Первый пост соавтора', '', opening['bot_text'], ''])
         for row in rows:
             output.extend([f"## Ход {row['id']} · {row['created_at']}", "", "### Ты", "", row['user_text'],
                            "", "### Соавтор", "", row['bot_text'], ""])

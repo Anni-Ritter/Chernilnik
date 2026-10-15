@@ -28,6 +28,9 @@ class RoleplayEngine:
         recent_query = new_post + '\n' + '\n'.join((row['user_text'] + row['bot_text'])[-500:] for row in recent[-2:])
         memories = select_memories(self.db.list_facts(sid), recent_query)
         transcript = []
+        opening = self.db.get_opening(sid)
+        if opening and len(recent) < 8:
+            transcript.append(f"[ПЕРВЫЙ ПОСТ СОАВТОРА]\n{opening['bot_text']}")
         # Avoid growing API context without bound while preserving whole turns on disk.
         for row in recent:
             transcript.append(f"[ХОД {row['id']}, ПОЛЬЗОВАТЕЛЬ]\n{row['user_text']}\n"
@@ -60,6 +63,38 @@ class RoleplayEngine:
                 f"Параметры: длина={SETTINGS['post_length']} (ориентир 200-400 слов), "
                 f"инициатива={SETTINGS['initiative']}/5, детализация={SETTINGS['description']}/5, "
                 "третье лицо, строгие границы управления персонажами пользователя.")
+
+    async def generate_opening(self, sid: int):
+        """Generate the bot's first move without inventing a user's preceding post."""
+        session = self.db.get_session(sid)
+        if session is None:
+            raise ValueError('Unknown story')
+        prompt = (
+            f"НОВАЯ ИСТОРИЯ: {session['title']}\n\n"
+            f"МИР: {session['world'] or 'Свободная история; осторожно обозначь обстановку, не вводи масштабных законов мира без нужды.'}\n\n"
+            f"ПЕРСОНАЖИ И АВТОРСТВО: {session['cast'] or 'Пользователь управляет своими персонажами. Начни сцену от лица своего персонажа или NPC, не играй за героя пользователя.'}\n\n"
+            f"ВРЕМЯ: {session['scene_time'] or 'Не задано. Не придумывай календарную дату без нужды.'}\n"
+            f"МЕСТО: {session['current_location'] or 'Не задано, выбери простую естественную отправную точку.'}\n\n"
+            "НАПИШИ ПЕРВЫЙ ПОСТ ИСТОРИИ. Пользователь ещё не совершал игрового хода. "
+            "Пост должен быть полноценным художественным началом от третьего лица, "
+            "с внутренними мыслями и конкретными действиями твоего персонажа, "
+            "с естественной возможностью для пользователя вступить в сцену. "
+            "Не предполагай, что персонаж пользователя что-то произнёс, решил, согласился или почувствовал. "
+            "Не подменяй его реакцию и не раскрывай знания, которых нет у твоего героя. "
+            "Не описывай длительную предысторию вместо настоящего действия. "
+            "Не форсируй близость, трагедию или неожиданный поворот ради эффектного начала. "
+            "Не обращайся к автору, не предлагай варианты, не пиши заголовок или инструкцию."
+        )
+        response = await self.client.responses.create(
+            model=self.model, instructions=self.instructions(), input=prompt,
+            max_output_tokens=self.max_output_tokens, store=False,
+        )
+        answer = (response.output_text or '').strip()
+        if not answer:
+            raise RuntimeError('Модель не вернула стартовый пост.')
+        usage = getattr(response, 'usage', None)
+        return (answer, getattr(usage, 'input_tokens', 0) or 0,
+                getattr(usage, 'output_tokens', 0) or 0)
 
     async def generate(self, sid: int, post: str):
         response = await self.client.responses.create(

@@ -8,7 +8,7 @@ import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -38,6 +38,8 @@ HELP = (
     'Литературный соавтор · личный бот\n\n'
     'Просто отправь пост — получишь продолжение без выбора вариантов.\n\n'
     '/new Название — новая отдельная история\n'
+    '/begin — бот первым пишет начало текущей истории\n'
+    '/opening — ещё раз показать первый пост (без перегенерации)\n'
     '/sessions — список историй\n'
     '/switch ID — выбрать историю\n'
     '/world Описание — мир и законы (заменить)\n'
@@ -76,6 +78,12 @@ def current(user_id: int):
     return session
 
 
+def begin_keyboard(sid: int):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='✒️ Начать историю — первый пост бота', callback_data=f'begin:{sid}')
+    ]])
+
+
 async def send_long(message: Message, content: str):
     """Respect Telegram's 4096 character limit without changing story text."""
     max_size = 3900
@@ -104,7 +112,8 @@ async def cmd_start(message: Message):
     if not await ensure_access(message):
         return
     session = current(message.from_user.id)
-    await message.answer(HELP + f'\n\nСейчас активна история #{session["id"]}: {session["title"]}')
+    reply_markup = begin_keyboard(session['id']) if not db.get_opening(session['id']) and not db.recent_turns(session['id'], 1) else None
+    await message.answer(HELP + f'\n\nСейчас активна история #{session["id"]}: {session["title"]}', reply_markup=reply_markup)
 
 
 @router.message(Command('new'))
@@ -113,8 +122,12 @@ async def cmd_new(message: Message, command: CommandObject):
         return
     title = (command.args or '').strip()[:100] or 'Свободная история'
     sid = db.new_session(message.from_user.id, title)
-    await message.answer(f'Новая отдельная история #{sid}: {title}. Можно сразу писать первый пост.\n'
-                         'При желании сначала задай /cast, /world и /time.')
+    await message.answer(
+        f'Новая история #{sid}: {title}.\n'
+        'Сначала при желании задай /cast, /world, /time, /location.\n'
+        'Когда всё готово, нажми кнопку или отправь /begin: первый пост напишу я.',
+        reply_markup=begin_keyboard(sid),
+    )
 
 
 @router.message(Command('sessions'))
@@ -149,7 +162,11 @@ async def set_field(message: Message, command: CommandObject, field: str, syntax
         return
     sid = current(message.from_user.id)['id']
     db.set_session_field(sid, field, value)
-    await message.answer('Записано для текущей истории. Это не меняет другие ролевые.')
+    if not db.get_opening(sid) and not db.recent_turns(sid, 1):
+        await message.answer('Записано для этой истории. Когда будешь готова, начинаю первым.',
+                             reply_markup=begin_keyboard(sid))
+    else:
+        await message.answer('Записано для текущей истории. Это не меняет другие ролевые.')
 
 
 @router.message(Command('world'))
@@ -204,13 +221,15 @@ async def cmd_status(message: Message):
         return
     session = current(message.from_user.id)
     turns = db.recent_turns(session['id'], 999999)
-    usage_in = sum(row['input_tokens'] for row in turns)
-    usage_out = sum(row['output_tokens'] for row in turns)
+    opening = db.get_opening(session['id'])
+    usage_in = sum(row['input_tokens'] for row in turns) + (opening['input_tokens'] if opening else 0)
+    usage_out = sum(row['output_tokens'] for row in turns) + (opening['output_tokens'] if opening else 0)
     memory_uses = db.usage_summary(session['id'])
     memory_in = sum(r['input_tokens'] for r in memory_uses)
     memory_out = sum(r['output_tokens'] for r in memory_uses)
     await message.answer(f'История #{session["id"]}: {session["title"]}\n' 
-                         f'Ходов: {len(turns)}\nФактов: {len(db.list_facts(session["id"], 999999))}\n'
+                         f'Ходов: {len(turns)}; первый пост: {"есть" if opening else "нет"}\n'
+                         f'Фактов: {len(db.list_facts(session["id"], 999999))}\n'
                          f'Время: {session["scene_time"] or "не задано"}\n'
                          f'Модель: {MODEL}; память: {MEMORY_MODEL}\n'
                          f'Токены генерации: вход {usage_in}, выход {usage_out}.\n'
@@ -225,7 +244,75 @@ async def cmd_last(message: Message):
     if rows:
         await send_long(message, rows[-1]['bot_text'])
     else:
-        await message.answer('В этой истории ещё нет ходов.')
+        opening = db.get_opening(current(message.from_user.id)['id'])
+        if opening:
+            await send_long(message, opening['bot_text'])
+        else:
+            await message.answer('В этой истории ещё нет ходов.')
+
+
+@router.message(Command('opening'))
+async def cmd_opening(message: Message):
+    if not await ensure_access(message):
+        return
+    opening = db.get_opening(current(message.from_user.id)['id'])
+    if opening:
+        await send_long(message, opening['bot_text'])
+    else:
+        await message.answer('Начального поста пока нет. Используй /begin.')
+
+
+async def start_story(message: Message, user_id: int, requested_sid=None):
+    async with story_lock:
+        session = current(user_id)
+        sid = session['id']
+        if requested_sid is not None and sid != requested_sid:
+            await message.answer('Эта кнопка относится к другой истории. Переключись через /switch ID.')
+            return
+        if db.get_opening(sid):
+            await message.answer('В этой истории я уже написал первый пост. /opening покажет его повторно.')
+            return
+        if db.recent_turns(sid, 1):
+            await message.answer('Эта история уже началась. Нельзя создавать новый первый пост поверх сыгранных ходов.')
+            return
+        await message.bot.send_chat_action(message.chat.id, 'typing')
+        try:
+            opening, inp, out = await engine.generate_opening(sid)
+            db.add_opening(sid, opening, MODEL, inp, out)
+        except Exception:
+            log.exception('Opening generation or persistence failed')
+            await message.answer('Не удалось начать историю. Начальный пост не сохранён; '
+                                 'проверь API и логи Bothost, затем снова /begin.')
+            return
+        try:
+            await send_long(message, opening)
+        except Exception:
+            log.exception('Opening saved but Telegram delivery failed. Recover with /opening')
+        try:
+            await engine.memorize(sid, None, '', opening)
+        except Exception:
+            log.exception('Opening memory extraction failed. The opening is safely stored.')
+
+
+@router.message(Command('begin'))
+async def cmd_begin(message: Message):
+    if await ensure_access(message):
+        await start_story(message, message.from_user.id)
+
+
+@router.callback_query(F.data.startswith('begin:'))
+async def callback_begin(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != OWNER:
+        await callback.answer('Недоступно.', show_alert=True)
+        return
+    try:
+        sid = int(callback.data.split(':', 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer('Неверная кнопка.', show_alert=True)
+        return
+    await callback.answer()
+    if isinstance(callback.message, Message):
+        await start_story(callback.message, callback.from_user.id, requested_sid=sid)
 
 
 @router.message(Command('export'))
@@ -257,6 +344,10 @@ async def cmd_cancel(message: Message):
 async def play(message: Message, post: str):
     async with story_lock:
         session = current(message.from_user.id)
+        if not db.get_opening(session['id']) and not db.recent_turns(session['id'], 1):
+            await message.answer('Сначала я должен написать первый пост. Нажми /begin; '
+                                 'после этого отвечай как обычно. Твой текст не потерян: его можно отправить снова.')
+            return False
         await message.bot.send_chat_action(message.chat.id, 'typing')
         try:
             answer, inp, out = await engine.generate(session['id'], post)

@@ -33,3 +33,11 @@ When the deploy is healthy, visit the bot in Telegram and send `/start`, `/new T
 The SQLite database is created automatically on first startup in `/app/data`, retained across deploys. Export stories with `/export` and keep backups.
 
 If the bot is not responding: check deploy logs for missing env variables, Python dependency errors, or insufficient OpenAI API credits.
+
+
+## Update existing BotHost Pro installation to v0.2
+
+1. Upload this ZIP as an update to **the existing bot**, not as a new bot. Keep the same environment variables and the database path `/app/data/roleplay.sqlite3`.
+2. Restart/redeploy from the BotHost panel. Your existing SQLite tables are preserved; an `openings` table is created automatically.
+3. Start a fresh story with `/new`, set `/cast` and optional `/time`, then press the **Start story** Telegram button or send `/begin`. The bot speaks first.
+4. Previously started stories are unchanged; `/begin` refuses to overwrite their history.
