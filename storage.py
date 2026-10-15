@@ -77,6 +77,28 @@ class Store:
                     user_id INTEGER PRIMARY KEY,
                     session_id INTEGER REFERENCES sessions(id)
                 );
+                CREATE TABLE IF NOT EXISTS characters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'npc' CHECK(role IN ('user','bot','npc')),
+                    description TEXT NOT NULL DEFAULT '',
+                    appearance_override TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(session_id, name COLLATE NOCASE)
+                );
+                CREATE INDEX IF NOT EXISTS characters_session_idx ON characters(session_id);
+                CREATE TABLE IF NOT EXISTS character_photos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+                    telegram_file_id TEXT NOT NULL,
+                    local_path TEXT NOT NULL,
+                    visual_description TEXT NOT NULL DEFAULT '',
+                    analysis_status TEXT NOT NULL DEFAULT 'pending',
+                    is_primary INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS photos_character_idx ON character_photos(character_id);
                 CREATE TABLE IF NOT EXISTS drafts (
                     user_id INTEGER PRIMARY KEY,
                     session_id INTEGER NOT NULL REFERENCES sessions(id),
@@ -205,7 +227,105 @@ class Store:
         opening = self.get_opening(sid)
         if opening:
             output.extend(['## Первый пост соавтора', '', opening['bot_text'], ''])
+        chars = self.list_characters(sid)
+        if chars:
+            output.extend(['## Карточки персонажей', ''])
+            for ch in chars:
+                output.extend([f"### {ch['name']} ({ch['role']})", '', ch['description'], '',
+                               'Уточнение внешности автора: ' + ch['appearance_override'], ''])
+                for photo in self.photos(ch['id']):
+                    output.extend([f"Фото-референс #{photo['id']} (основной: {bool(photo['is_primary'])}): "
+                                   + photo['visual_description'], ''])
         for row in rows:
             output.extend([f"## Ход {row['id']} · {row['created_at']}", "", "### Ты", "", row['user_text'],
                            "", "### Соавтор", "", row['bot_text'], ""])
         return '\n'.join(output)
+
+    # Character sheets and image references are separate for each story.
+    # The schema uses CREATE IF NOT EXISTS, so old Bothost databases migrate in place.
+    def add_character(self, sid: int, name: str, role: str = 'npc') -> int:
+        if role not in ('user', 'bot', 'npc') or not (1 <= len(name.strip()) <= 80):
+            raise ValueError('invalid character')
+        with self.connect() as db:
+            cursor = db.execute('INSERT INTO characters(session_id,name,role) VALUES (?,?,?)',
+                                (sid, name.strip(), role))
+            return cursor.lastrowid
+
+    def list_characters(self, sid: int):
+        with self.connect() as db:
+            return db.execute('SELECT * FROM characters WHERE session_id=? ORDER BY name COLLATE NOCASE', (sid,)).fetchall()
+
+    def get_character(self, cid: int):
+        with self.connect() as db:
+            return db.execute('SELECT * FROM characters WHERE id=?', (cid,)).fetchone()
+
+    def set_character_role(self, cid: int, role: str):
+        if role not in ('user', 'bot', 'npc'):
+            raise ValueError('unknown role')
+        with self.connect() as db:
+            db.execute('UPDATE characters SET role=? WHERE id=?', (role, cid))
+
+    def set_character_text(self, cid: int, field: str, value: str):
+        if field not in ('description', 'appearance_override'):
+            raise ValueError('invalid character field')
+        with self.connect() as db:
+            db.execute(f'UPDATE characters SET {field}=? WHERE id=?', (value[:6000], cid))
+
+    def photos(self, cid: int):
+        with self.connect() as db:
+            return db.execute('SELECT * FROM character_photos WHERE character_id=? ORDER BY is_primary DESC, id DESC',
+                              (cid,)).fetchall()
+
+    def get_photo(self, pid: int):
+        with self.connect() as db:
+            return db.execute('SELECT * FROM character_photos WHERE id=?', (pid,)).fetchone()
+
+    def add_photo(self, cid: int, file_id: str, path: str, description: str = '', status: str = 'ok'):
+        with self.connect() as db:
+            existing = db.execute('SELECT COUNT(*) FROM character_photos WHERE character_id=?', (cid,)).fetchone()[0]
+            if existing >= 5:
+                raise ValueError('max 5 photos per character')
+            db.execute('UPDATE character_photos SET is_primary=0 WHERE character_id=?', (cid,))
+            cur = db.execute('INSERT INTO character_photos(character_id,telegram_file_id,local_path,visual_description,analysis_status,is_primary) '
+                             'VALUES (?,?,?,?,?,1)', (cid, file_id, path, description[:2500], status))
+            return cur.lastrowid
+
+    def update_photo_analysis(self, pid: int, description: str, status: str):
+        with self.connect() as db:
+            db.execute('UPDATE character_photos SET visual_description=?,analysis_status=? WHERE id=?',
+                       (description[:2500], status, pid))
+
+    def make_primary_photo(self, cid: int, pid: int):
+        with self.connect() as db:
+            if not db.execute('SELECT 1 FROM character_photos WHERE id=? AND character_id=?', (pid, cid)).fetchone():
+                raise ValueError('photo does not belong to character')
+            db.execute('UPDATE character_photos SET is_primary=0 WHERE character_id=?', (cid,))
+            db.execute('UPDATE character_photos SET is_primary=1 WHERE id=?', (pid,))
+
+    def delete_photo(self, cid: int, pid: int):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM character_photos WHERE id=? AND character_id=?', (pid, cid)).fetchone()
+            if row is None:
+                return None
+            db.execute('DELETE FROM character_photos WHERE id=?', (pid,))
+            if row['is_primary']:
+                next_photo = db.execute('SELECT id FROM character_photos WHERE character_id=? ORDER BY id DESC LIMIT 1',
+                                        (cid,)).fetchone()
+                if next_photo:
+                    db.execute('UPDATE character_photos SET is_primary=1 WHERE id=?', (next_photo['id'],))
+            return dict(row)
+
+    def rename_character(self, cid: int, name: str):
+        if not (1 <= len(name.strip()) <= 80):
+            raise ValueError('invalid name')
+        with self.connect() as db:
+            db.execute('UPDATE characters SET name=? WHERE id=?', (name.strip(), cid))
+
+    def delete_character(self, sid: int, cid: int):
+        with self.connect() as db:
+            record = db.execute('SELECT * FROM characters WHERE id=? AND session_id=?', (cid, sid)).fetchone()
+            if not record:
+                return []
+            photos = db.execute('SELECT local_path FROM character_photos WHERE character_id=?', (cid,)).fetchall()
+            db.execute('DELETE FROM characters WHERE id=? AND session_id=?', (cid, sid))
+            return [row['local_path'] for row in photos]

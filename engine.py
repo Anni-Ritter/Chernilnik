@@ -22,6 +22,30 @@ class RoleplayEngine:
         self.auto_memory = auto_memory
         self.max_output_tokens = max_output_tokens
 
+    def character_context(self, sid: int) -> str:
+        """Permanent character cards with author/character knowledge separation."""
+        items = []
+        for char in self.db.list_characters(sid):
+            role = {'user': 'ИГРОК управляет', 'bot': 'СОАВТОР управляет',
+                    'npc': 'СОАВТОР управляет NPC'}[char['role']]
+            sections = [f"{char['name']} ({role})"]
+            if char['description']:
+                sections.append('Биография/характер (от автора): ' + char['description'][:3500])
+            if char['appearance_override']:
+                sections.append('ВНЕШНОСТЬ: уточнение автора (выше приоритет): ' + char['appearance_override'][:2400])
+            photos = self.db.photos(char['id'])
+            for p in photos[:5]:
+                if p['visual_description'] and p['analysis_status'] == 'ok':
+                    sections.append(('Основной фото-референс' if p['is_primary'] else 'Дополнительный фото-референс')
+                                    + ': ' + p['visual_description'][:1100 if p['is_primary'] else 260])
+            items.append('\n'.join(sections))
+        return ('\n\n'.join(items) if items else 'Карточек пока нет.') + (
+            '\nВАЖНО: информация в карточках принадлежит автору и не становится '
+            'автоматически знанием персонажей. Внешние признаки можно описывать '
+            'в сцене, только если это соответствует наблюдениям и условиям сцены. '
+            'Не приписывай скрытые сведения по внешности. При описании персонажа игрока '
+            'не назначай ему новых действий, реплик, ощущений или мыслей.')
+
     def context(self, sid: int, new_post: str):
         session = self.db.get_session(sid)
         recent = self.db.recent_turns(sid, 8)
@@ -39,6 +63,7 @@ class RoleplayEngine:
             f"ИСТОРИЯ: {session['title']}",
             f"МИР И ЕГО КАНОН:\n{session['world'] or 'Свободная ролевая, мир формируется по ходу. Не устанавливай лишний канон без необходимости.'}",
             f"РОЛИ И ГРАНИЦЫ АВТОРСТВА:\n{session['cast'] or 'Персонажи пользователя принадлежат пользователю. Ты ведёшь остальных персонажей и мир; имена и роли выясняются из сцены.'}",
+            "КАРТОЧКИ ПЕРСОНАЖЕЙ И ВНЕШНОСТЬ (авторская справка, без автоматической передачи секретов героям):\n" + self.character_context(sid),
             f"ЗАКРЕПЛЁННАЯ ХРОНОЛОГИЯ/ВРЕМЯ: {session['scene_time'] or 'Не задано. Не вычисляй время по числу сообщений.'}",
             f"ТЕКУЩАЯ ЛОКАЦИЯ: {session['current_location'] or 'Не задана.'}",
             'ДОЛГОСРОЧНАЯ ПАМЯТЬ (belief и uncertain НЕ считать объективными фактами):\n' + ('\n'.join(memories) if memories else 'Нет записей.'),
@@ -73,6 +98,7 @@ class RoleplayEngine:
             f"НОВАЯ ИСТОРИЯ: {session['title']}\n\n"
             f"МИР: {session['world'] or 'Свободная история; осторожно обозначь обстановку, не вводи масштабных законов мира без нужды.'}\n\n"
             f"ПЕРСОНАЖИ И АВТОРСТВО: {session['cast'] or 'Пользователь управляет своими персонажами. Начни сцену от лица своего персонажа или NPC, не играй за героя пользователя.'}\n\n"
+            f"КАРТОЧКИ И ФОТОРЕФЕРЕНСЫ:\n{self.character_context(sid)}\n\n"
             f"ВРЕМЯ: {session['scene_time'] or 'Не задано. Не придумывай календарную дату без нужды.'}\n"
             f"МЕСТО: {session['current_location'] or 'Не задано, выбери простую естественную отправную точку.'}\n\n"
             "НАПИШИ ПЕРВЫЙ ПОСТ ИСТОРИИ. Пользователь ещё не совершал игрового хода. "

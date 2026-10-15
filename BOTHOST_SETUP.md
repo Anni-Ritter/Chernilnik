@@ -41,3 +41,14 @@ If the bot is not responding: check deploy logs for missing env variables, Pytho
 2. Restart/redeploy from the BotHost panel. Your existing SQLite tables are preserved; an `openings` table is created automatically.
 3. Start a fresh story with `/new`, set `/cast` and optional `/time`, then press the **Start story** Telegram button or send `/begin`. The bot speaks first.
 4. Previously started stories are unchanged; `/begin` refuses to overwrite their history.
+
+
+## Обновление существующего Bothost Pro бота до v0.3
+
+**НЕ создавай нового бота и НЕ удаляй папку `/app/data`**. Залей ZIP версии 0.3 как обновление в существующий проект на Bothost Pro; главный файл — `bot.py`. Сохрани прежние `BOT_TOKEN`, `OPENAI_API_KEY` и `OWNER_TELEGRAM_ID`. Переменные `DATABASE_PATH=/app/data/roleplay.sqlite3` и `MEDIA_DIR=/app/data/portraits` должны указывать на постоянный раздел.
+
+Необязательно: `VISION_MODEL=gpt-6-luna` (по умолчанию и так Luna). Обработка фото не требует отдельного API-ключа, но расходует токены OpenAI **один раз при загрузке или повторном анализе**.
+
+После перезапуска отправь `/start`, нажми `👤 Персонажи` → `➕ Новый персонаж` → укажи имя и роль → `➕ Фото`; отправь изображение. Дождись описания внешности; открой карточку и проверь его. Проверяй логи если бот пишет «анализ не удался».
+
+Схема SQLite расширяется автоматически: старые таблицы `sessions`, `turns`, `facts`, `openings` не пересоздаются; добавляются `characters` и `character_photos`. Ролевые посты и память останутся на месте **при условии, что путь к существующей SQLite БД остался тем же**. Сделай резервную копию `/app/data` перед обновлением.

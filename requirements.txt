@@ -2,3 +2,4 @@ aiogram>=3.20,<4
 openai>=1.100,<3
 python-dotenv>=1.0,<2
 pytest>=8,<10
+Pillow>=10,<12

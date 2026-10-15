@@ -113,7 +113,15 @@ async def cmd_start(message: Message):
         return
     session = current(message.from_user.id)
     reply_markup = begin_keyboard(session['id']) if not db.get_opening(session['id']) and not db.recent_turns(session['id'], 1) else None
-    await message.answer(HELP + f'\n\nСейчас активна история #{session["id"]}: {session["title"]}', reply_markup=reply_markup)
+    from interface import MAIN_KEYS, main_menu
+    await message.answer(f'✒️ Чернильник · твой литературный соавтор\n'
+                         f'Активная история #{session["id"]}: {session["title"]}.\n'
+                         'Обычные сообщения — ролевые посты. Открой меню кнопками ниже.',
+                         reply_markup=MAIN_KEYS)
+    await message.answer('Выбери, что настроить или открыть:', reply_markup=main_menu())
+    if reply_markup:
+        await message.answer('Когда настроишь героев, я могу первым начать историю.',
+                             reply_markup=reply_markup)
 
 
 @router.message(Command('new'))
@@ -330,7 +338,9 @@ async def cmd_draft(message: Message):
         return
     sid = current(message.from_user.id)['id']
     db.start_draft(message.from_user.id, sid)
-    await message.answer('Режим длинного поста включён. Присылай части отдельными сообщениями, затем /play.')
+    from interface import DRAFT_KEYS
+    await message.answer('Режим длинного поста. Присылай части отдельными сообщениями, затем нажми «📨 Отправить пост».',
+                         reply_markup=DRAFT_KEYS)
 
 
 @router.message(Command('cancel'))
@@ -338,15 +348,16 @@ async def cmd_cancel(message: Message):
     if not await ensure_access(message):
         return
     db.clear_draft(message.from_user.id)
-    await message.answer('Черновик удалён. История не менялась.')
+    from interface import MAIN_KEYS
+    await message.answer('Черновик удалён. История не менялась.', reply_markup=MAIN_KEYS)
 
 
-async def play(message: Message, post: str):
+async def play(message: Message, post: str, user_id: int | None = None):
     async with story_lock:
-        session = current(message.from_user.id)
+        session = current(user_id if user_id is not None else message.from_user.id)
         if not db.get_opening(session['id']) and not db.recent_turns(session['id'], 1):
-            await message.answer('Сначала я должен написать первый пост. Нажми /begin; '
-                                 'после этого отвечай как обычно. Твой текст не потерян: его можно отправить снова.')
+            await message.answer('Сначала я должен написать первый пост. Нажми «✒️ Начать» в нижней панели '
+                                 'или в меню. Твой текст не потерян: отправь его после начала истории.')
             return False
         await message.bot.send_chat_action(message.chat.id, 'typing')
         try:
@@ -383,6 +394,8 @@ async def cmd_play(message: Message):
         return
     if await play(message, draft['text']):
         db.clear_draft(message.from_user.id)
+        from interface import MAIN_KEYS
+        await message.answer('✅ Пост отправлен.', reply_markup=MAIN_KEYS)
 
 
 @router.message(F.text)
@@ -396,7 +409,9 @@ async def on_text(message: Message):
     draft = db.draft_active(message.from_user.id)
     if draft:
         db.append_draft(message.from_user.id, text)
-        await message.answer('Часть сохранена в черновике. Отправляй дальше или /play.')
+        from interface import DRAFT_KEYS
+        await message.answer('Часть добавлена в черновик. Можешь писать дальше или нажать «📨 Отправить пост».',
+                             reply_markup=DRAFT_KEYS)
         return
     await play(message, text)
 
@@ -406,6 +421,8 @@ async def main():
         raise SystemExit('Укажи BOT_TOKEN, OPENAI_API_KEY и OWNER_TELEGRAM_ID в переменных окружения или .env.')
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
+    from interface import register_interface
+    dp.include_router(await register_interface(db, engine, OWNER, start_story, play))
     dp.include_router(router)
     await dp.start_polling(bot)
 
