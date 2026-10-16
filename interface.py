@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, BufferedInputFile,
+    ReplyKeyboardRemove, BufferedInputFile,
 )
 from vision import MAX_IMAGE_BYTES, describe_image, image_info
 
@@ -33,15 +33,17 @@ class Editing(StatesGroup):
     custom_polza_model = State()
 
 
-DRAFT_KEYS = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text='📨 Отправить пост'), KeyboardButton(text='❌ Отменить черновик')],
-    [KeyboardButton(text='🗂 Меню')],
-], resize_keyboard=True, input_field_placeholder='Часть длинного ролевого поста')
-
-
-# The old five-row keyboard hid the input field. All advanced functions remain
-# available via Telegram's slash-command menu and /menu inline controls.
+# Never create a persistent reply keyboard, including in long-post mode.
+# Telegram commands and one-off inline buttons live in chat messages instead.
 MAIN_KEYS = ReplyKeyboardRemove()
+DRAFT_KEYS = ReplyKeyboardRemove()
+
+
+def draft_menu():
+    return keyboard([
+        [('📨 Отправить пост', 'ui:draftsend'), ('❌ Отменить', 'ui:draftcancel')],
+        [('← Дополнительные настройки', 'ui:home')],
+    ])
 
 
 def keyboard(rows):
@@ -334,7 +336,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
                 await state.set_state(Editing.custom_polza_model)
                 await message.answer('Пришли точный ID модели из каталога Polza, например: '
                                      'google/gemini-3.7-flash\n'
-                                     'Для отмены нажми «🗂 Меню».')
+                                     'Для отмены используй /menu.')
         elif action == 'style':
             await show_style(message, uid)
         elif action == 'styleadd':
@@ -344,7 +346,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
                 await state.set_state(Editing.style_example)
                 await message.answer('🎨 Отправь одним сообщением удачный литературный пост '
                                      '(50–5500 символов). Это НЕ ролевой ход, он не изменит сюжет. '
-                                     'Для отмены нажми «🗂 Меню».')
+                                     'Для отмены используй /menu.')
         elif action == 'styleitem' and arg.isdigit():
             item = next((x for x in db.list_style_examples(uid) if x['id'] == int(arg)), None)
             if item:
@@ -445,7 +447,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
                     await message.answer(f'🖼 Отправь фото персонажа «{ch["name"]}» обычной фотографией '
                                          'или документом JPG/PNG/WEBP (до 12 МБ).\n'
                                          'Бот сохранит файл и попробует описать внешность. '
-                                         'Для отмены нажми «🗂 Меню».')
+                                         'Для отмены используй /menu.')
         elif action == 'primary' and arg.isdigit():
             photo = db.get_photo(int(arg))
             if photo and active_char(photo['character_id'], uid):
@@ -486,7 +488,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             label = {'world': 'уточнения только этого сюжета', 'cast': 'распределение ролей',
                      'scene_time': 'время и сезон', 'current_location': 'место действия'}[arg]
             await message.answer(f'✏️ Пришли {label} одним сообщением. Старое значение будет заменено.\n'
-                                 'Для отмены нажми «🗂 Меню».')
+                                 'Для отмены используй /menu.')
         elif action == 'memory':
             sid = active(uid)['id']
             facts = db.list_facts(sid, 15)
@@ -507,8 +509,8 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             if not existing or existing['session_id'] != sid:
                 db.start_draft(uid, sid)
             await message.answer('📝 Режим длинного поста. Присылай части обычными сообщениями. '
-                                 'Когда закончишь — нажми «📨 Отправить пост» внизу.',
-                                 reply_markup=DRAFT_KEYS)
+                                 'Когда закончишь — нажми «📨 Отправить пост» здесь или используй /play.',
+                                 reply_markup=draft_menu())
         elif action == 'draftsend':
             draft = db.draft_active(uid)
             if not draft or not draft['text'].strip() or draft['session_id'] != active(uid)['id']:
@@ -562,7 +564,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         try:
             choice = engine.select_generation_model('polza', (message.text or '').strip())
         except (ValueError, OSError) as exc:
-            await message.answer(str(exc) + '\nПришли правильный ID или нажми «🗂 Меню».')
+            await message.answer(str(exc) + '\nПришли правильный ID или открой /menu.')
             return
         await state.clear()
         await message.answer(f'✅ Выбрано: {choice.display()}.', reply_markup=model_menu(engine))
@@ -744,7 +746,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
     @router.message(Editing.photo)
     async def photo_instructions(message: Message):
         if authorized_id(message.from_user, message.chat):
-            await message.answer('Жду именно фото или изображение-документ. Чтобы выйти, нажми «🗂 Меню».')
+            await message.answer('Жду именно фото или изображение-документ. Чтобы выйти, открой /menu.')
 
     @router.message(F.photo | F.document)
     async def photo_outside_flow(message: Message):

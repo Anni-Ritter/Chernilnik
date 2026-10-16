@@ -263,7 +263,7 @@ async def register_world_ui(db, owner: int, engine=None):
         for key,label in PROFILE_FIELDS.items():
             value = fields.get(key)
             if value:
-                mark = ' ≈' if value['certainty'] != 'confirmed' else (' ✦' if value['source']=='model' else '')
+                mark = ' ≈' if value['certainty'] != 'confirmed' else (' ✦' if value['source'] in ('model','story') else '')
                 bits.append(f'• {label}: {value["value"][:220]}{mark}')
         if not rows:
             bits.append('Анкета пока пуста — это нормально.')

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -137,7 +138,16 @@ async def cmd_menu(message: Message):
     if not await ensure_access(message):
         return
     from interface import main_menu
-    await message.answer('⚙️ Дополнительные настройки Чернильника:',reply_markup=main_menu())
+    await message.answer('Клавиатура скрыта. Дополнительные настройки — ниже.',
+                         reply_markup=ReplyKeyboardRemove())
+    await message.answer('⚙️ Настройки Чернильника:', reply_markup=main_menu())
+
+
+@router.message(Command('hidekeyboard'))
+async def cmd_hide_keyboard(message: Message):
+    if await ensure_access(message):
+        await message.answer('Нижнюю клавиатуру скрыла. Все функции — через команды /menu.',
+                             reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Command('new'))
@@ -400,9 +410,10 @@ async def cmd_draft(message: Message):
         return
     sid = current(message.from_user.id)['id']
     db.start_draft(message.from_user.id, sid)
-    from interface import DRAFT_KEYS
-    await message.answer('Режим длинного поста. Присылай части отдельными сообщениями, затем нажми «📨 Отправить пост».',
-                         reply_markup=DRAFT_KEYS)
+    from interface import draft_menu
+    await message.answer('Режим длинного поста. Присылай части отдельными сообщениями. '
+                         'Для отправки используй /play или кнопки под этим сообщением.',
+                         reply_markup=draft_menu())
 
 
 @router.message(Command('cancel'))
@@ -418,8 +429,8 @@ async def play(message: Message, post: str, user_id: int | None = None):
     async with story_lock:
         session = current(user_id if user_id is not None else message.from_user.id)
         if not db.get_opening(session['id']) and not db.recent_turns(session['id'], 1):
-            await message.answer('Сначала я должен написать первый пост. Нажми «✒️ Начать» в нижней панели '
-                                 'или в меню. Твой текст не потерян: отправь его после начала истории.')
+            await message.answer('Сначала я должен написать первый пост. Используй /begin или открой /menu. '
+                                 'Твой текст не потерян: отправь его после начала истории.')
             return False
         try:
             async with typing_during(message.bot, message.chat.id):
@@ -471,9 +482,9 @@ async def on_text(message: Message):
     draft = db.draft_active(message.from_user.id)
     if draft:
         db.append_draft(message.from_user.id, text)
-        from interface import DRAFT_KEYS
-        await message.answer('Часть добавлена в черновик. Можешь писать дальше или нажать «📨 Отправить пост».',
-                             reply_markup=DRAFT_KEYS)
+        from interface import draft_menu
+        await message.answer('Часть добавлена в черновик. Продолжай писать или нажми /play.',
+                             reply_markup=draft_menu())
         return
     await play(message, text)
 
@@ -500,6 +511,8 @@ async def main():
             BotCommand(command='worlds', description='Миры и общий канон'),
             BotCommand(command='sessions', description='Открыть другую историю'),
             BotCommand(command='menu', description='Дополнительные настройки'),
+            BotCommand(command='draft', description='Длинный пост: собрать по частям'),
+            BotCommand(command='play', description='Отправить собранный пост'),
             BotCommand(command='model', description='Модель художественного текста'),
             BotCommand(command='backup', description='Скачать копию базы'),
             BotCommand(command='cancelsetup', description='Отменить подготовку истории'),
@@ -507,6 +520,17 @@ async def main():
         ])
     except Exception:
         log.exception('Telegram commands menu setup failed; regular slash commands still work')
+    # Telegram retains custom reply keyboards until the bot explicitly removes them.
+    # Send one cleanup message on first deployment of this hotfix, not on every restart.
+    marker = Path(DB_PATH).parent / '.reply_keyboard_removed_v071'
+    if not marker.exists():
+        try:
+            await bot.send_message(OWNER, 'Убрала нижнюю панель кнопок. Теперь просто пиши мне; '
+                                   'дополнительные функции — в /menu.',
+                                   reply_markup=ReplyKeyboardRemove())
+            marker.touch()
+        except Exception:
+            log.exception('Cannot hide old Telegram reply keyboard on startup; /hidekeyboard is available')
     await dp.start_polling(bot)
 
 

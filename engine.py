@@ -158,7 +158,7 @@ class RoleplayEngine:
                   + '\nМИР: ' + (world['name'] if world else 'не привязан'))
         response = await self.client.responses.create(
             model=self.memory_model, instructions=EXTRACT_INSTRUCTIONS, input=prompt,
-            max_output_tokens=1200, store=False,
+            max_output_tokens=2000, store=False,
             text={'format': {'type': 'json_object'}},
         )
         usage = getattr(response, 'usage', None)
@@ -182,7 +182,7 @@ class RoleplayEngine:
                     self.db.add_world_event(world['id'],statement,sid,turn_id,evidence,status='confirmed')
         if isinstance(data.get('character_insights'),list):
             names = {c['name'].casefold():c for c in cast}
-            for item in data['character_insights'][:5]:
+            for item in data['character_insights'][:8]:
                 if not isinstance(item,dict):
                     continue
                 target = names.get(str(item.get('name','')).strip().casefold())
@@ -193,16 +193,20 @@ class RoleplayEngine:
                 if (not target or not evidence or evidence not in source_text
                         or not 10 <= len(text) <= 500 or certainty not in ('confirmed','interpretation')):
                     continue
-                if target['role']=='user' and (certainty!='confirmed' or field in
-                    ('fears','defenses','attachments','conflicts','self_image','goals')):
-                    # No speculative inner life for the player's character.
-                    continue
+                if target['role'] == 'user':
+                    # For an author-controlled hero, ONLY their author can establish
+                    # inner life/biography. The bot's post is not evidence.
+                    if certainty != 'confirmed' or not post or evidence not in post:
+                        continue
                 self.db.add_development(target['id'],sid,turn_id,text,evidence,certainty)
-                if field in PROFILE_FIELDS and target['role'] != 'user':
-                    # A story-local working sheet; never overwrite an author profile.
+                if field in PROFILE_FIELDS and certainty == 'confirmed':
+                    # Story-local evolving sheet for BOTH players. Never overwrite
+                    # any manually authored / imported field or story correction.
                     current = self.db.profile_fields(target['id'],sid)
-                    author_fields = {f['field'] for f in current if f['session_id']==0}
-                    if field not in author_fields and certainty=='confirmed':
+                    protected = {f['field'] for f in current
+                                 if f['session_id']==0 or f['source'] not in ('model','story')}
+                    if field not in protected:
                         self.db.set_profile_field(target['id'],field,text,sid=sid,
-                                                  source='model',certainty='confirmed',evidence=evidence)
+                                                  source='story' if target['role']=='user' else 'model',
+                                                  certainty='confirmed',evidence=evidence)
         return len(validated)
