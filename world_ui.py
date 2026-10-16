@@ -4,6 +4,7 @@ Menus use short callback_data and FSM forms, and never treat form input as RP.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from io import BytesIO
@@ -14,7 +15,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from worlds import PROFILE_FIELDS, PROFILE_GROUPS
-from lore_import import analyze_bible, apply_bible, render_import_preview, MAX_SOURCE
+from lore_import import (analyze_bible, apply_bible, render_import_preview, MAX_SOURCE,
+                         ImportDraft, draft_root, plan_from_draft, split_source)
 from typing_status import typing_during
 from generation_models import DEFAULT_POLZA_MODEL
 import os
@@ -44,6 +46,7 @@ def kb(rows):
 
 async def register_world_ui(db, owner: int, engine=None):
     router = Router(name='worlds_ui')
+    import_lock = asyncio.Lock()
 
     def allowed(user, chat):
         return bool(user and user.id == owner and chat and chat.type == 'private')
@@ -103,6 +106,8 @@ async def register_world_ui(db, owner: int, engine=None):
             return
         desc = (world['description'] or 'Пока нет описания.')[:1700]
         rows = [[('🤖 ИИ-импорт библии мира', f'w:import:{wid}')],
+                *([[('⏯ Продолжить ИИ-импорт',f'w:importresume:{wid}')]]
+                  if ImportDraft.latest(draft_root(db),wid) else []),
                 [('📜 Заменить канон', f'w:canon:{wid}'), ('➕ Дополнить', f'w:canonadd:{wid}')],
                 [('📚 Энциклопедия: страны и места', f'w:lore:{wid}')],
                 [('📥 Выгрузить канон', f'w:exportcanon:{wid}')],
@@ -119,6 +124,58 @@ async def register_world_ui(db, owner: int, engine=None):
                          f'📜 Канон:\n{desc}\n\n'
                          'Подробности стран, географии, магии и общества пиши обычным текстом в каноне мира. '
                          'Глобальные изменения истории — в хронике событий.', reply_markup=kb(rows))
+
+    async def send_import_preview(msg, wid: int, draft: ImportDraft, plan: dict):
+        preview=render_import_preview(plan,db.get_world(wid)['name'])
+        await msg.answer_document(
+            BufferedInputFile(preview.encode('utf-8'),filename=f'world_{wid}_AI_preview.md'),
+            caption='📄 Проверь статьи, анкеты, пометки легенд и цитаты из оригинала.')
+        article_names=', '.join(x['title'] for x in plan['articles'][:7]) or 'не найдены'
+        people_names=', '.join(x['name'] for x in plan['people'][:7]) or 'не найдены'
+        await msg.answer(
+            f'🤖 ПРЕДПРОСМОТР · {db.get_world(wid)["name"]}\n\n'
+            f'Готово: {plan["parts"]} фрагментов\n'
+            f'📚 Статей: {len(plan["articles"])}\n'
+            f'👤 Персонажей: {len(plan["people"])}\n'
+            f'📜 Общих правил: {len(plan["summary"])}\n\n'
+            f'Статьи: {article_names}\n\nПерсонажи: {people_names}\n\n'
+            'До подтверждения база не меняется. Существующие статьи и поля автора не перезаписываются.',
+            reply_markup=kb([[('✅ Распределить по библиотеке',f'w:impsave:{wid}:{draft.digest}')],
+                             [('✖️ Отменить',f'w:impcancel:{wid}:{draft.digest}')]]))
+
+    async def run_import(msg, wid: int, draft: ImportDraft, state: FSMContext):
+        if import_lock.locked():
+            return await msg.answer('⏳ Другой ИИ-импорт ещё выполняется. Дождись его завершения.')
+        async with import_lock:
+            parts=split_source(draft.source)
+            done=draft.completed_root_parts(parts)
+            status=await msg.answer(f'📚 Импорт через Polza · {draft.model}\n'
+                                    f'Уже сохранено: {done}/{len(parts)} частей. Продолжаю…')
+            async def progress(n,total):
+                try:
+                    await status.edit_text(f'📚 ИИ-импорт: {n}/{total} частей. '
+                                           'Результаты сохраняются в черновик, не в канон.')
+                except Exception:
+                    pass
+            try:
+                async with typing_during(msg.bot,msg.chat.id):
+                    plan=await analyze_bible(engine.polza_client,draft.model,draft.source,
+                                             on_progress=progress,draft=draft)
+            except Exception as exc:
+                log.exception('Resumable world bible import failed; draft remains on disk')
+                done=draft.completed_root_parts(parts)
+                # API errors may include sensitive metadata. Do not echo raw exceptions.
+                await state.clear()
+                return await msg.answer(
+                    f'⚠️ Импорт прервался. Готово {done}/{len(parts)} частей.\n'
+                    'Проверенные результаты сохранены в /app/data/import_drafts. '
+                    'После исправления ошибки можно продолжить без повторной оплаты за готовые части.\n'
+                    f'Тип ошибки: {type(exc).__name__}. Подробности — в логах BotHost.',
+                    reply_markup=kb([[('🔄 Повторить неудачные части',f'w:importretry:{wid}:{draft.digest}')],
+                                     [('✖️ Отменить черновик',f'w:impcancel:{wid}:{draft.digest}')]]))
+            await state.set_state(Form.lore_import_confirm)
+            await state.update_data(wid=wid, digest=draft.digest)
+            await send_import_preview(msg,wid,draft,plan)
 
     async def story_worlds(msg):
         rows = [[('🌿 Свободная история (без общего мира)', 'w:storynew:0')]]
@@ -307,7 +364,6 @@ async def register_world_ui(db, owner: int, engine=None):
         p = (callback.data or '').split(':')
         action = p[1] if len(p)>1 else ''
         arg = int(p[2]) if len(p)>2 and p[2].isdigit() else 0
-        pending_import=await state.get_data() if action in ('importyes','importno') else {}
         await state.clear()
         if action == 'home':
             await home(msg,uid)
@@ -349,35 +405,58 @@ async def register_world_ui(db, owner: int, engine=None):
         elif action == 'import' and db.get_world(arg):
             if engine is None or engine.polza_client is None:
                 return await msg.answer('Для ИИ-импорта нужен POLZA_API_KEY в BotHost.')
+            draft=ImportDraft.latest(draft_root(db),arg)
             await state.set_state(Form.lore_import)
             await state.update_data(wid=arg)
+            rows=[[('← Назад к миру',f'w:world:{arg}')]]
+            if draft:
+                rows.insert(0,[('⏯ Продолжить предыдущий импорт',f'w:importretry:{arg}:{draft.digest}')])
             await msg.answer('🤖 ИИ-ИМПОРТ · '+db.get_world(arg)['name']+'\n\n'
-                             'Пришли полную библию мира файлом .md или .txt (UTF-8, до 155 тыс. символов).\n'
-                             'Gemini сам выделит энциклопедические статьи, устойчивые законы и персонажей. '
-                             'Сначала покажу, что нашлось; в базу попадёт только после твоего подтверждения.\n'
-                             'Непроверенные легенды останутся легендами. Импорт расходует токены Polza.')
-        elif action == 'importno':
-            await world_menu(msg, arg, uid)
-        elif action == 'importyes':
-            if (not pending_import or pending_import.get('wid')!=arg
-                    or 'plan' not in pending_import or 'source' not in pending_import):
-                return await msg.answer('Черновик импорта не найден (возможно, бот перезапускался). Загрузить снова: /worlds')
-            if not db.get_world(arg):
-                return await msg.answer('Мир больше не существует.')
+                             'Пришли полную библию мира файлом .md/.txt (UTF-8, до 155 тыс. символов).\n'
+                             'Каждая проверенная часть будет сохранена в отдельный черновик. '
+                             'В канон сведения попадут только после твоего подтверждения.\n'
+                             'Можно продолжить неудачный импорт без повторной загрузки файла.',
+                             reply_markup=kb(rows))
+        elif action in ('importresume','importretry'):
+            if engine is None or engine.polza_client is None or not db.get_world(arg):
+                return await msg.answer('Мир не найден или POLZA_API_KEY не настроен.')
             try:
-                # The base is backed up before the first character-table migration;
-                # save a fresh snapshot before each confirmed bulk import too.
+                draft=(ImportDraft(draft_root(db),arg,p[3])
+                       if len(p)>3 else ImportDraft.latest(draft_root(db),arg))
+                if draft is None or draft.data.get('applied') or draft.data.get('cancelled'):
+                    return await msg.answer('Незавершённый черновик не найден. Начни импорт из меню мира.')
+            except (ValueError,OSError,KeyError):
+                return await msg.answer('Не удалось открыть черновик. Проверь /app/data/import_drafts.')
+            await run_import(msg,arg,draft,state)
+        elif action in ('impcancel','importno'):
+            try:
+                draft=(ImportDraft(draft_root(db),arg,p[3]) if len(p)>3
+                       else ImportDraft.latest(draft_root(db),arg))
+                if draft and not draft.data.get('applied'):
+                    draft.cancel()
+            except (ValueError,OSError,KeyError):
+                pass
+            await msg.answer('✖️ Черновик отменён. Канон и персонажи не менялись.')
+            await world_menu(msg,arg,uid)
+        elif action in ('impsave','importyes'):
+            try:
+                draft=(ImportDraft(draft_root(db),arg,p[3]) if len(p)>3
+                       else ImportDraft.latest(draft_root(db),arg))
+                if not draft or not draft.complete or draft.data.get('cancelled') or draft.data.get('applied'):
+                    return await msg.answer('Полный черновик не найден или уже применён. Открой мир через /worlds.')
+                plan=plan_from_draft(draft)
                 db.make_backup()
-                counts=apply_bible(db,arg,pending_import['source'],pending_import['plan'])
+                counts=apply_bible(db,arg,draft.source,plan)
+                draft.mark_applied()
             except Exception:
-                log.exception('Failed applying AI bible import')
-                return await msg.answer('Сохранить импорт не удалось. База не должна быть частично обновлена; проверь логи.')
+                log.exception('Failed applying confirmed AI bible import')
+                return await msg.answer('Не удалось сохранить импорт. Посмотри логи; черновик сохранён.')
             await msg.answer(f'✅ Импорт завершён!\n\n📚 Статей: {counts["articles"]}\n'
                              f'👤 Новых персонажей: {counts["characters"]}\n'
                              f'🧠 Полей анкет: {counts["fields"]}\n'
                              f'📜 Базовых правил: {counts["summary"]}\n'
-                             f'⏭ Пропущено существующих/слишком длинных: {counts["skipped"]}\n\n'
-                             'Полный исходный файл сохранён в /app/data/imports; существующие авторские данные не перезаписаны.')
+                             f'⏭ Пропущено: {counts["skipped"]}\n\n'
+                             'Исходник сохранён в /app/data/imports; старые данные не перезаписаны.')
             await world_menu(msg,arg,uid)
         elif action == 'canonadd' and db.get_world(arg):
             await state.set_state(Form.world_description)
@@ -506,41 +585,11 @@ async def register_world_ui(db, owner: int, engine=None):
         choice=engine.generation_choice()
         model=os.getenv('LORE_IMPORT_MODEL','').strip() or (
             choice.model if choice.provider=='polza' else DEFAULT_POLZA_MODEL)
-        status=await message.answer(f'📚 Разбираю библию мира через Polza · {model}…')
-        async def progress(done, total):
-            try:
-                await status.edit_text(f'📚 ИИ-импорт: разобрано {done}/{total} фрагментов. '
-                                       'Исходный файл пока не меняет базу.')
-            except Exception:
-                pass
         try:
-            async with typing_during(message.bot,message.chat.id):
-                plan=await analyze_bible(engine.polza_client,model,source,on_progress=progress)
-        except Exception as exc:
-            log.exception('AI world bible import failed')
-            return await message.answer('ИИ не смог разобрать документ целиком. Ничего не сохранено. '
-                                        f'Причина: {str(exc)[:300]}')
-        await state.update_data(plan=plan,source=source)
-        await state.set_state(Form.lore_import_confirm)
-        article_names=', '.join(x['title'] for x in plan['articles'][:8]) or 'не найдены'
-        people_names=', '.join(x['name'] for x in plan['people'][:8]) or 'не найдены'
-        preview=render_import_preview(plan,db.get_world(wid)['name'])
-        await message.answer_document(BufferedInputFile(preview.encode('utf-8'),
-                                  filename=f'world_{wid}_AI_preview.md'),
-                                  caption='📄 Все найденные статьи, персонажи и цитаты — проверь перед сохранением.')
-        await message.answer(
-            f'🤖 ПРЕДПРОСМОТР ИМПОРТА · {db.get_world(wid)["name"]}\n\n'
-            f'Обработано фрагментов: {plan["parts"]}\n'
-            f'📚 Статей: {len(plan["articles"])}\n'
-            f'👤 Персонажей: {len(plan["people"])}\n'
-            f'📜 Общих правил: {len(plan["summary"])}\n\n'
-            f'Статьи: {article_names}\n\nПерсонажи: {people_names}\n\n'
-            'Проверь, что всё разумно. Пустые поля анкет останутся пустыми, '
-            'легенды не превратятся в установленные факты. '
-            'Повторный импорт не перезаписывает существующие статьи и авторские анкеты.\n'
-            '⚠️ Gemini может пропустить часть сведений: оригинал будет сохранён целиком.',
-            reply_markup=kb([[('✅ Распределить по библиотеке',f'w:importyes:{wid}')],
-                             [('✖️ Отменить без изменений',f'w:importno:{wid}')]]))
+            draft=ImportDraft.create(draft_root(db),wid,source,model)
+        except (ValueError,OSError) as exc:
+            return await message.answer(f'Не удалось сохранить черновик: {exc}')
+        await run_import(message,wid,draft,state)
 
     @router.message(Form.lore_import_confirm, F.text | F.document)
     async def awaiting_import_confirmation(message: Message, state: FSMContext):
@@ -548,10 +597,10 @@ async def register_world_ui(db, owner: int, engine=None):
             return
         data=await state.get_data()
         wid=data.get('wid',0)
-        await message.answer('Черновик импорта готов. Выбери действие кнопкой под предыдущим сообщением: '
-                             '«Распределить» или «Отменить».',
-                             reply_markup=kb([[('✅ Распределить',f'w:importyes:{wid}')],
-                                              [('✖️ Отменить',f'w:importno:{wid}')]]))
+        digest=data.get('digest','')
+        await message.answer('Предпросмотр готов. Выбери под ним «Распределить» или «Отменить».',
+                             reply_markup=kb([[('✅ Распределить',f'w:impsave:{wid}:{digest}')],
+                                              [('✖️ Отменить',f'w:impcancel:{wid}:{digest}')]]))
 
     @router.message(Form.world_name, F.text)
     async def add_world(message: Message, state: FSMContext):
