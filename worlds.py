@@ -97,7 +97,8 @@ class WorldMixin:
             # Legacy characters retain their previous story memberships and photos.
             db.execute('''INSERT OR IGNORE INTO story_characters(session_id,character_id,role)
                 SELECT session_id,id,role FROM characters''')
-            db.execute('PRAGMA user_version=6')
+            if db.execute('PRAGMA user_version').fetchone()[0] < 6:
+                db.execute('PRAGMA user_version=6')
 
     def add_world(self, name: str):
         name = name.strip()
@@ -331,3 +332,53 @@ class WorldMixin:
         with self.connect() as db:
             return db.execute('''SELECT * FROM character_development WHERE character_id=? AND session_id=?
                 ORDER BY id DESC LIMIT ?''', (cid,sid,limit)).fetchall()
+
+    def enable_library_only_characters(self):
+        """v0.6.1: allow world-library character without inventing a story.
+
+        SQLite cannot DROP NOT NULL from an existing column, so make a verified,
+        backed-up table copy. Child tables retain their original FK name.
+        """
+        with self.connect() as db:
+            col = next(r for r in db.execute('PRAGMA table_info(characters)')
+                       if r['name']=='session_id')
+            if not col['notnull']:
+                return
+            integrity = db.execute('PRAGMA quick_check').fetchone()[0]
+            if integrity != 'ok':
+                raise RuntimeError('Ошибка целостности базы перед обновлением анкет: '+str(integrity))
+        self.make_backup()
+        import sqlite3
+        db=sqlite3.connect(self.path)
+        try:
+            db.execute('PRAGMA foreign_keys=OFF')
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('''CREATE TABLE characters_library_upgrade (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER REFERENCES sessions(id),
+                name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'npc' CHECK(role IN ('user','bot','npc')),
+                description TEXT NOT NULL DEFAULT '',
+                appearance_override TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                world_id INTEGER REFERENCES worlds(id),
+                UNIQUE(session_id, name COLLATE NOCASE)
+            )''')
+            db.execute('''INSERT INTO characters_library_upgrade
+                (id,session_id,name,role,description,appearance_override,created_at,world_id)
+                SELECT id,session_id,name,role,description,appearance_override,created_at,world_id
+                FROM characters''')
+            db.execute('DROP TABLE characters')
+            db.execute('ALTER TABLE characters_library_upgrade RENAME TO characters')
+            db.execute('CREATE INDEX IF NOT EXISTS characters_session_idx ON characters(session_id)')
+            db.execute('PRAGMA user_version=7')
+            db.commit()
+            db.execute('PRAGMA foreign_keys=ON')
+            mistakes=list(db.execute('PRAGMA foreign_key_check'))
+            if mistakes:
+                raise RuntimeError(f'Найдены нарушенные ссылки после миграции персонажей: {mistakes[:3]}')
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()

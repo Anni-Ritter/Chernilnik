@@ -14,6 +14,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from worlds import PROFILE_FIELDS, PROFILE_GROUPS
+from lore_import import analyze_bible, apply_bible, render_import_preview, MAX_SOURCE
+from typing_status import typing_during
+from generation_models import DEFAULT_POLZA_MODEL
+import os
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +31,8 @@ class Form(StatesGroup):
     lore_edit = State()
     lore_append = State()
     profile_field = State()
+    lore_import = State()
+    lore_import_confirm = State()
 
 
 def kb(rows):
@@ -36,7 +42,7 @@ def kb(rows):
     ])
 
 
-async def register_world_ui(db, owner: int):
+async def register_world_ui(db, owner: int, engine=None):
     router = Router(name='worlds_ui')
 
     def allowed(user, chat):
@@ -45,20 +51,20 @@ async def register_world_ui(db, owner: int):
     def active(uid):
         return db.ensure_current_session(uid)
 
-    async def form_text(message: Message) -> str:
+    async def form_text(message: Message, max_bytes: int = 90000) -> str:
         """Accept a Telegram message or UTF-8 txt/md attachment in form mode."""
         if message.text is not None:
             return message.text.strip()
         document = message.document
         if document is None or not (document.file_name or '').lower().endswith(('.txt', '.md')):
             raise ValueError('Пришли текстом или файлом .txt/.md (UTF-8).')
-        if document.file_size is not None and document.file_size > 90000:
-            raise ValueError('Файл слишком большой (до 90 КБ).')
+        if document.file_size is not None and document.file_size > max_bytes:
+            raise ValueError(f'Файл слишком большой (до {max_bytes//1000} КБ).')
         buf = BytesIO()
         await message.bot.download(document, destination=buf)
         raw = buf.getvalue()
-        if len(raw) > 90000:
-            raise ValueError('Файл слишком большой (до 90 КБ).')
+        if len(raw) > max_bytes:
+            raise ValueError(f'Файл слишком большой (до {max_bytes//1000} КБ).')
         try:
             return raw.decode('utf-8-sig').strip()
         except UnicodeError:
@@ -96,7 +102,8 @@ async def register_world_ui(db, owner: int):
             await msg.answer('Мир не найден.')
             return
         desc = (world['description'] or 'Пока нет описания.')[:1700]
-        rows = [[('📜 Заменить канон', f'w:canon:{wid}'), ('➕ Дополнить', f'w:canonadd:{wid}')],
+        rows = [[('🤖 ИИ-импорт библии мира', f'w:import:{wid}')],
+                [('📜 Заменить канон', f'w:canon:{wid}'), ('➕ Дополнить', f'w:canonadd:{wid}')],
                 [('📚 Энциклопедия: страны и места', f'w:lore:{wid}')],
                 [('📥 Выгрузить канон', f'w:exportcanon:{wid}')],
                 [('🗞 События мира', f'w:events:{wid}'), ('👥 Жители', f'w:library:{wid}')],
@@ -300,6 +307,7 @@ async def register_world_ui(db, owner: int):
         p = (callback.data or '').split(':')
         action = p[1] if len(p)>1 else ''
         arg = int(p[2]) if len(p)>2 and p[2].isdigit() else 0
+        pending_import=await state.get_data() if action in ('importyes','importno') else {}
         await state.clear()
         if action == 'home':
             await home(msg,uid)
@@ -338,6 +346,39 @@ async def register_world_ui(db, owner: int):
             w=db.get_world(arg)
             await msg.answer_document(BufferedInputFile(w['description'].encode('utf-8'),
                                                      filename=f'world_{arg}_canon.txt'))
+        elif action == 'import' and db.get_world(arg):
+            if engine is None or engine.polza_client is None:
+                return await msg.answer('Для ИИ-импорта нужен POLZA_API_KEY в BotHost.')
+            await state.set_state(Form.lore_import)
+            await state.update_data(wid=arg)
+            await msg.answer('🤖 ИИ-ИМПОРТ · '+db.get_world(arg)['name']+'\n\n'
+                             'Пришли полную библию мира файлом .md или .txt (UTF-8, до 155 тыс. символов).\n'
+                             'Gemini сам выделит энциклопедические статьи, устойчивые законы и персонажей. '
+                             'Сначала покажу, что нашлось; в базу попадёт только после твоего подтверждения.\n'
+                             'Непроверенные легенды останутся легендами. Импорт расходует токены Polza.')
+        elif action == 'importno':
+            await world_menu(msg, arg, uid)
+        elif action == 'importyes':
+            if (not pending_import or pending_import.get('wid')!=arg
+                    or 'plan' not in pending_import or 'source' not in pending_import):
+                return await msg.answer('Черновик импорта не найден (возможно, бот перезапускался). Загрузить снова: /worlds')
+            if not db.get_world(arg):
+                return await msg.answer('Мир больше не существует.')
+            try:
+                # The base is backed up before the first character-table migration;
+                # save a fresh snapshot before each confirmed bulk import too.
+                db.make_backup()
+                counts=apply_bible(db,arg,pending_import['source'],pending_import['plan'])
+            except Exception:
+                log.exception('Failed applying AI bible import')
+                return await msg.answer('Сохранить импорт не удалось. База не должна быть частично обновлена; проверь логи.')
+            await msg.answer(f'✅ Импорт завершён!\n\n📚 Статей: {counts["articles"]}\n'
+                             f'👤 Новых персонажей: {counts["characters"]}\n'
+                             f'🧠 Полей анкет: {counts["fields"]}\n'
+                             f'📜 Базовых правил: {counts["summary"]}\n'
+                             f'⏭ Пропущено существующих/слишком длинных: {counts["skipped"]}\n\n'
+                             'Полный исходный файл сохранён в /app/data/imports; существующие авторские данные не перезаписаны.')
+            await world_menu(msg,arg,uid)
         elif action == 'canonadd' and db.get_world(arg):
             await state.set_state(Form.world_description)
             await state.update_data(wid=arg, mode='append')
@@ -445,6 +486,73 @@ async def register_world_ui(db, owner: int):
                 db.set_world_event_status(arg,'archived' if action=='archive' else 'confirmed')
                 await events(msg,e['world_id'])
 
+    @router.message(Form.lore_import, F.text | F.document)
+    async def receive_bible(message: Message, state: FSMContext):
+        if not allowed(message.from_user,message.chat):
+            return
+        data=await state.get_data()
+        wid=data.get('wid')
+        if not wid or not db.get_world(wid):
+            await state.clear()
+            return await message.answer('Мир не найден. Открой /worlds.')
+        if engine is None or engine.polza_client is None:
+            return await message.answer('POLZA_API_KEY не настроен.')
+        try:
+            source=await form_text(message,max_bytes=190000)
+            if len(source)>MAX_SOURCE or not source:
+                return await message.answer('Текст пуст или слишком большой (максимум 155 тыс. символов).')
+        except ValueError as exc:
+            return await message.answer(str(exc))
+        choice=engine.generation_choice()
+        model=os.getenv('LORE_IMPORT_MODEL','').strip() or (
+            choice.model if choice.provider=='polza' else DEFAULT_POLZA_MODEL)
+        status=await message.answer(f'📚 Разбираю библию мира через Polza · {model}…')
+        async def progress(done, total):
+            try:
+                await status.edit_text(f'📚 ИИ-импорт: разобрано {done}/{total} фрагментов. '
+                                       'Исходный файл пока не меняет базу.')
+            except Exception:
+                pass
+        try:
+            async with typing_during(message.bot,message.chat.id):
+                plan=await analyze_bible(engine.polza_client,model,source,on_progress=progress)
+        except Exception as exc:
+            log.exception('AI world bible import failed')
+            return await message.answer('ИИ не смог разобрать документ целиком. Ничего не сохранено. '
+                                        f'Причина: {str(exc)[:300]}')
+        await state.update_data(plan=plan,source=source)
+        await state.set_state(Form.lore_import_confirm)
+        article_names=', '.join(x['title'] for x in plan['articles'][:8]) or 'не найдены'
+        people_names=', '.join(x['name'] for x in plan['people'][:8]) or 'не найдены'
+        preview=render_import_preview(plan,db.get_world(wid)['name'])
+        await message.answer_document(BufferedInputFile(preview.encode('utf-8'),
+                                  filename=f'world_{wid}_AI_preview.md'),
+                                  caption='📄 Все найденные статьи, персонажи и цитаты — проверь перед сохранением.')
+        await message.answer(
+            f'🤖 ПРЕДПРОСМОТР ИМПОРТА · {db.get_world(wid)["name"]}\n\n'
+            f'Обработано фрагментов: {plan["parts"]}\n'
+            f'📚 Статей: {len(plan["articles"])}\n'
+            f'👤 Персонажей: {len(plan["people"])}\n'
+            f'📜 Общих правил: {len(plan["summary"])}\n\n'
+            f'Статьи: {article_names}\n\nПерсонажи: {people_names}\n\n'
+            'Проверь, что всё разумно. Пустые поля анкет останутся пустыми, '
+            'легенды не превратятся в установленные факты. '
+            'Повторный импорт не перезаписывает существующие статьи и авторские анкеты.\n'
+            '⚠️ Gemini может пропустить часть сведений: оригинал будет сохранён целиком.',
+            reply_markup=kb([[('✅ Распределить по библиотеке',f'w:importyes:{wid}')],
+                             [('✖️ Отменить без изменений',f'w:importno:{wid}')]]))
+
+    @router.message(Form.lore_import_confirm, F.text | F.document)
+    async def awaiting_import_confirmation(message: Message, state: FSMContext):
+        if not allowed(message.from_user,message.chat):
+            return
+        data=await state.get_data()
+        wid=data.get('wid',0)
+        await message.answer('Черновик импорта готов. Выбери действие кнопкой под предыдущим сообщением: '
+                             '«Распределить» или «Отменить».',
+                             reply_markup=kb([[('✅ Распределить',f'w:importyes:{wid}')],
+                                              [('✖️ Отменить',f'w:importno:{wid}')]]))
+
     @router.message(Form.world_name, F.text)
     async def add_world(message: Message, state: FSMContext):
         if not allowed(message.from_user,message.chat):
@@ -455,7 +563,8 @@ async def register_world_ui(db, owner: int):
             return await message.answer('Не удалось создать мир: возможно, такое название уже есть. Попробуй другое.')
         await state.clear()
         await message.answer('✅ Мир создан. Теперь можно один раз описать его устройство.',
-                             reply_markup=kb([[('📜 Заполнить канон',f'w:canon:{wid}')],
+                             reply_markup=kb([[('🤖 Разобрать библию мира через ИИ',f'w:import:{wid}')],
+                                              [('📜 Заполнить канон вручную',f'w:canon:{wid}')],
                                               [('➕ Создать первую историю',f'w:storynew:{wid}')]]))
 
     @router.message(Form.world_description, F.text | F.document)

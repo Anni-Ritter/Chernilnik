@@ -18,6 +18,7 @@ class Store(WorldMixin):
         self.init_db()
         self._backup_before_world_migration()
         self.init_worlds()
+        self.enable_library_only_characters()
 
     def make_backup(self) -> Path:
         """Consistent hot snapshot; does not alter or move live SQLite."""

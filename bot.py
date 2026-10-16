@@ -477,7 +477,7 @@ async def main():
     dp = Dispatcher()
     from interface import register_interface
     from world_ui import register_world_ui
-    dp.include_router(await register_world_ui(db, OWNER))
+    dp.include_router(await register_world_ui(db, OWNER, engine))
     dp.include_router(await register_interface(db, engine, OWNER, start_story, play))
     dp.include_router(router)
     await dp.start_polling(bot)

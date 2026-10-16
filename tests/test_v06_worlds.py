@@ -93,7 +93,7 @@ def test_old_database_automatically_backed_up_and_migrated(tmp_path):
     backups=list((tmp_path/'backups').glob('*.sqlite3'))
     assert backups
     with sqlite3.connect(path) as con:
-        assert con.execute('PRAGMA user_version').fetchone()[0]==6
+        assert con.execute('PRAGMA user_version').fetchone()[0]>=6
     Store(str(path))
     assert len(list((tmp_path/'backups').glob('*.sqlite3')))==len(backups)
 
