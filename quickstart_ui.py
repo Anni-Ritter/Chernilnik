@@ -19,7 +19,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKe
 
 from quickstart_core import (QuickDrafts, EXTRACT_SYSTEM, setup_prompt,
                              decode_json, validate_plan, need_clarification,
-                             find_world, wants_start, wants_new_story, install_plan)
+                             find_world, infer_world_from_lore, wants_start, wants_new_story, install_plan, choose_world_in_draft)
 from typing_status import typing_during
 from setup_dialogue import (generate_setup_reply, save_assistant_reply, is_discussion_only, split_telegram_text)
 from vision import image_info, MAX_IMAGE_BYTES, describe_image
@@ -59,7 +59,7 @@ async def register_quickstart(db, engine, owner: int, begin_story):
             await message.answer('Уже есть подготовленная история. Отправь «погнали» ещё раз, '
                                  'чтобы начать её без повторного создания. Или /cancelsetup.')
             return
-        wid = find_world(seed, db.list_worlds()) if seed else None
+        wid = infer_world_from_lore(db, [seed]) if seed else None
         draft = drafts.start(uid, wid, title=title, seed=seed)
         if seed:
             # The author already started a conversation; respond to the idea,
@@ -103,15 +103,16 @@ async def register_quickstart(db, engine, owner: int, begin_story):
                 await message.answer('Сначала закончим уже созданную историю: напиши «погнали». '
                                      'Если хочешь отказаться — /cancelsetup.')
                 return
-        if draft is None:
-            draft = drafts.start(uid, wid)
-        draft['world_id'] = wid
-        draft['phase'] = 'collect'
-        drafts.save(uid, draft)
+        should_start = choose_world_in_draft(drafts, uid, wid)
+        if should_start:
+            # The author already said 'погнали' BEFORE the world picker.
+            # Answering the clarification is consent to continue that start.
+            await finish(message, uid)
+            return
         world = db.get_world(wid) if wid else None
         await message.answer(f'{world["name"] if world else "Свободный мир"} — принято. '
-                             'Можешь рассказывать сюжет и героев просто как в разговоре. '
-                             'Я учту детали; никаких анкет заполнять не нужно.')
+                             'Описание и персонажи из нашего разговора остались в черновике. '
+                             'Можешь продолжать или сказать «погнали».')
 
     async def extract(draft):
         # Setup uses the same selected literary provider, separate from OpenAI memory.
@@ -145,9 +146,19 @@ async def register_quickstart(db, engine, owner: int, begin_story):
             if not draft:
                 await message.answer('Сейчас нет подготовки. Напиши «хочу новую историю» или /new.')
                 return
-            if draft['phase'] == 'world' or draft['world_id'] is None:
-                await message.answer('Сначала уточни, в каком мире играем.', reply_markup=world_picker(db))
-                return
+            if draft['world_id'] is None:
+                inferred = infer_world_from_lore(db, draft.get('notes', []))
+                if inferred is not None:
+                    draft['world_id'] = inferred
+                    draft['phase'] = 'collect'
+                    drafts.save(uid, draft)
+                else:
+                    draft['pending_start'] = True
+                    drafts.save(uid, draft)
+                    await message.answer('Идею и героев помню, пересказывать ничего не нужно. '
+                                         'Уточни только мир — и сразу начну сцену.',
+                                         reply_markup=world_picker(db))
+                    return
             if not draft['notes'] and not draft.get('session_id'):
                 await message.answer('Расскажи хоть немного об идее и персонажах — тогда смогу начать.')
                 return
@@ -277,8 +288,9 @@ async def register_quickstart(db, engine, owner: int, begin_story):
                     except ValueError as err:
                         await message.answer(str(err))
                         return
+                will_start = bool(draft.get('pending_start'))
                 await select_world(message, uid, wid)
-                if len(text) > len(name) + 15:
+                if len(text) > len(name) + 15 and not will_start:
                     await respond(message, uid, text)
                 return
         # Discussion/questions are answered, but they are not authorial story facts.
@@ -288,6 +300,15 @@ async def register_quickstart(db, engine, owner: int, begin_story):
             except ValueError as err:
                 await message.answer(str(err))
                 return
+        # Discover an already-defined universe from its *known* world articles
+        # or character names. Do not interrogate the author for the same detail twice.
+        if draft['world_id'] is None:
+            inferred = infer_world_from_lore(db, drafts.get(uid).get('notes', []))
+            if inferred is not None:
+                latest_draft = drafts.get(uid)
+                latest_draft['world_id'] = inferred
+                latest_draft['phase'] = 'collect'
+                drafts.save(uid, latest_draft)
         # In 'clarify' we stay conversational, not force extraction on every answer.
         # At 'погнали' the canonical plan is validated and assembled in one pass.
         await respond(message, uid, text)

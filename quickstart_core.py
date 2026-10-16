@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 
 
-START_WORDS = re.compile(r'^\s*(?:погнали|начинай|начн[её]м|старт|всё[,! ]*погнали|давай\s+(?:начн[её]м|играть)|можно\s+начинать)[.!\s]*$', re.I)
+START_WORDS = re.compile(r'^\s*(?:погнали|начинай|начн[её]м|старт|всё[,! ]*погнали|давай\s+(?:начн[её]м|играть)|можно\s+начинать|можем\s+начинать|(?:как\s+хочешь[,\s]*)?можем\s+начинать|всё[,!\s]*можем\s+начинать)[.!\s]*$', re.I)
 NEW_STORY = re.compile(r'^\s*(?:(?:хочу|давай|начн[её]м|создай|сделай)\s+(?:новую\s+|начать\s+)?(?:историю|ролевую|ролку)|новую\s+(?:историю|ролевую|ролку)|сыграем\s+(?:в\s+)?(?:историю|ролку))\b', re.I)
 
 
@@ -31,6 +31,64 @@ def find_world(text: str, worlds: list) -> int | None:
         if re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', text, re.I):
             found.append(world['id'])
     return found[0] if len(found) == 1 else None
+
+
+# Do not confuse the location of a scene with its fictional universe unless the
+# name is unique in the owner's actual encyclopedia/character library.
+_GENERIC_LORE_NAMES = {
+    'география', 'история', 'персонажи', 'магия', 'раса', 'расы', 'религия',
+    'религии', 'хронология', 'общество', 'экономика', 'город', 'страна',
+    'канон', 'правила', 'законы', 'легенды', 'тайны', 'мир', 'гильдии',
+}
+
+
+def _mentions_entity(text: str, name: str, *, inflection: bool = False) -> bool:
+    """Match proper names with conservative Russian case-ending support."""
+    name = name.strip()
+    if len(name) < 5 or name.casefold() in _GENERIC_LORE_NAMES:
+        return False
+    if re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', text, flags=re.I):
+        return True
+    # E.g. Эльдора / Эльдоре / Эльдоры; avoid short common words and phrases.
+    if inflection and len(name) >= 7 and ' ' not in name and name[-1].casefold() in 'аяоеьй':
+        root = name[:-1]
+        return bool(re.search(r'(?<!\w)' + re.escape(root) + r'[а-яё]{0,3}(?!\w)', text, flags=re.I))
+    return False
+
+
+def infer_world_from_lore(db, notes: list[str]) -> int | None:
+    """Conservatively infer a world from explicit title or unique known named entities.
+
+    No generic guessing, no external model call, and no automatic merging of
+    similarly named people from multiple world libraries.
+    """
+    text = '\n'.join(notes or [])[-28000:]
+    worlds = db.list_worlds()
+    if not text.strip() or not worlds:
+        return None
+    by_name = find_world(text, worlds)
+    if by_name is not None:
+        return by_name
+    # Conflicting explicit world names are intentionally ambiguous.
+    if sum(bool(_mentions_entity(text, w['name'])) for w in worlds) > 1:
+        return None
+    matched_worlds = set()
+    for world in worlds:
+        wid = world['id']
+        # Only canonical *titles* and world character *names* are anchors.
+        # Searching lore bodies would wrongly count incidental mentions in every world.
+        for lore in db.list_world_lore(wid):
+            title = str(lore['title']).split('—')[0].split(':')[0].strip()
+            if _mentions_entity(text, title, inflection=True):
+                matched_worlds.add(wid)
+                break
+        if wid in matched_worlds:
+            continue
+        for ch in db.world_characters(wid):
+            if _mentions_entity(text, ch['name']):
+                matched_worlds.add(wid)
+                break
+    return next(iter(matched_worlds)) if len(matched_worlds) == 1 else None
 
 
 class QuickDrafts:
@@ -109,6 +167,22 @@ class QuickDrafts:
 
     def clear(self, uid: int):
         self._path(uid).unlink(missing_ok=True)
+
+
+def choose_world_in_draft(drafts: QuickDrafts, uid: int, wid: int) -> bool:
+    """Set universe without discarding preparation; return pending start intent.
+
+    This function is safe after redeploy because notes and pending_start are on
+    disk. The caller can immediately resume finish() when it returns True.
+    """
+    draft = drafts.get(uid)
+    if draft is None:
+        draft = drafts.start(uid, wid)
+    resume = bool(draft.pop('pending_start', False))
+    draft['world_id'] = wid
+    draft['phase'] = 'collect'
+    drafts.save(uid, draft)
+    return resume
 
 
 EXTRACT_SYSTEM = '''Ты технический разборщик авторского описания ролевой. Верни ТОЛЬКО JSON объект.
