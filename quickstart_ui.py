@@ -19,7 +19,8 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKe
 
 from quickstart_core import (QuickDrafts, EXTRACT_SYSTEM, setup_prompt,
                              decode_json, validate_plan, need_clarification,
-                             find_world, infer_world_from_lore, wants_start, wants_new_story, install_plan, choose_world_in_draft)
+                             find_world, infer_world_from_lore, wants_start, wants_new_story, install_plan, choose_world_in_draft,
+                             photo_reply_assignments, apply_author_photo_assignments)
 from typing_status import typing_during
 from setup_dialogue import (generate_setup_reply, save_assistant_reply, is_discussion_only, split_telegram_text)
 from vision import image_info, MAX_IMAGE_BYTES, describe_image
@@ -170,21 +171,48 @@ async def register_quickstart(db, engine, owner: int, begin_story):
                     return
             else:
                 try:
-                    async with typing_during(message.bot,message.chat.id):
-                        plan = await extract(draft)
+                    # A photo-identity clarification is deterministic. Do not
+                    # pay for another extract or discard its previous results.
+                    if draft.get('pending_photo_plan'):
+                        plan = validate_plan(draft['pending_photo_plan'], draft['photos'])
+                    else:
+                        async with typing_during(message.bot,message.chat.id):
+                            plan = await extract(draft)
                 except Exception:
                     log.exception('Quickstart setup extraction failed')
                     await message.answer('Не получилось разобрать описание. Ничего не потеряно. '
                                          'Попробуй ещё раз «погнали» или дополни идею.')
                     return
+                # Upgrade an existing v0.7.4 draft stuck in this exact loop:
+                # the author may already have answered "Кирай" but the old
+                # handler merely appended it to notes. Only recover it when
+                # *photo identity* is the outstanding clarification.
+                if (draft.get('phase') == 'clarify'
+                        and not draft.get('pending_photo_plan')
+                        and 'фотографи' in str(need_clarification(plan, draft) or '')
+                        and draft.get('notes')):
+                    legacy_answer = photo_reply_assignments(
+                        draft['notes'][-1], plan, draft, allow_single_answer=True)
+                    for photo in draft['photos']:
+                        if int(photo['index']) in legacy_answer:
+                            photo['character'] = legacy_answer[int(photo['index'])]
+                            photo['assigned_after_notes'] = len(draft['notes'])
+                if apply_author_photo_assignments(draft, plan):
+                    drafts.save(uid,draft)
+                plan = validate_plan(plan,draft['photos'])
                 question = need_clarification(plan,draft)
                 if question:
                     draft['phase'] = 'clarify'
+                    if 'фотографи' in question:
+                        draft['pending_photo_plan'] = plan
+                    else:
+                        draft.pop('pending_photo_plan', None)
                     drafts.save(uid,draft)
                     await message.answer(question)
                     return
                 # Before any SQLite writes persist the plan for crash recovery.
                 draft['plan'] = plan
+                draft.pop('pending_photo_plan', None)
                 drafts.save(uid,draft)
             try:
                 sid = install_plan(db,drafts,uid,draft,plan)
@@ -275,6 +303,37 @@ async def register_quickstart(db, engine, owner: int, begin_story):
         if wants_start(text):
             await finish(message, uid)
             return
+        # The bot explicitly asked "Whose photo is #1?". This is *structured
+        # user input*, not another unstructured story note for Gemini to guess.
+        if draft.get('phase') == 'clarify' and draft.get('pending_photo_plan'):
+            tentative = validate_plan(draft['pending_photo_plan'], draft['photos'])
+            assignment = photo_reply_assignments(text, tentative, draft,
+                                                 allow_single_answer=True)
+            if assignment:
+                for photo in draft['photos']:
+                    if int(photo['index']) in assignment:
+                        photo['character'] = assignment[int(photo['index'])]
+                        photo['assigned_after_notes'] = len(draft['notes'])
+                drafts.save(uid, draft)
+                updated = validate_plan(tentative, draft['photos'])
+                followup = need_clarification(updated, draft)
+                if followup:
+                    await message.answer('Привязку сохранила. ' + followup)
+                else:
+                    # No second "погнали": the author has answered the only
+                    # blocking clarification, so immediately start the story.
+                    await finish(message, uid)
+                return
+            # An unrelated short message cannot silently assign the photo.
+            # Longer edits are legitimate new setup information: retain them
+            # and redo extraction on the next start request.
+            if len(text) <= 85 and not is_discussion_only(text):
+                await message.answer('Не поняла, к какому персонажу привязать фото. '
+                                     'Назови имя из нашей истории или напиши «1 — Кирай».')
+                return
+            draft.pop('pending_photo_plan', None)
+            draft['phase'] = 'collect'
+            drafts.save(uid, draft)
         if draft['phase'] == 'world':
             wid = find_world(text, db.list_worlds())
             if text.casefold().strip(' .!') in ('без мира','свободная история','свой мир','без общего мира'):

@@ -202,7 +202,9 @@ EXTRACT_SYSTEM = '''Ты технический разборщик авторс�
 
 def setup_prompt(data: dict) -> str:
     notes = '\n\n'.join(f'СООБЩЕНИЕ {i+1}:\n{item}' for i,item in enumerate(data['notes']))
-    images = '\n'.join(f'ФОТО {p["index"]}: подпись: {p["caption"]!r}; ближайший текст: {p["near_text"]!r}; устойчивые визуальные признаки: {p.get("analysis", "")!r}'
+    images = '\n'.join(f'ФОТО {p["index"]}: подпись: {p["caption"]!r}; ближайший текст: {p["near_text"]!r}; '
+                       f'устойчивые визуальные признаки: {p.get("analysis", "")!r}; '
+                       f'АВТОР ЯВНО НАЗВАЛ ПЕРСОНАЖА: {p.get("character", "")!r}'
                        for p in data['photos'])
     return ('Описание автора для НОВОЙ ролевой (последние исправления важнее ранних):\n'
             + notes + '\n\n' + images + '\n\nОтветь JSON, не прозой.')
@@ -222,6 +224,95 @@ def decode_json(raw: str) -> dict:
     if not isinstance(result, dict):
         raise ValueError('Ожидался JSON-объект.')
     return result
+
+
+
+# Photo identity comes from the author, not from a plausible guess by the LLM.
+# This function deliberately uses only explicit number/name pairs or a short
+# answer to a *single outstanding* photo-identity clarification.
+_PHOTO_NUMBER = re.compile(
+    r'(?<!\w)(?:фот(?:о|ография|ографии)?\s*|изображени[ея]\s*|'
+    r'картинк[а-я]*\s*|портрет\s*)?(?:№\s*)?'
+    r'(?P<number>[1-9][0-9]?|первая|первое|первый|вторая|второе|второй|'
+    r'третья|третье|третий|четв[её]ртая|четв[её]ртое|четв[её]ртый)'
+    r'(?!\w)', re.I,
+)
+_ORDINALS = {'первая': 1, 'первое': 1, 'первый': 1,
+             'вторая': 2, 'второе': 2, 'второй': 2,
+             'третья': 3, 'третье': 3, 'третий': 3,
+             'четвёртая': 4, 'четвёртое': 4, 'четвёртый': 4,
+             'четвертая': 4, 'четвертое': 4, 'четвертый': 4}
+
+
+def _character_mentions(text: str, plan: dict) -> list[str]:
+    return [c['name'] for c in plan.get('characters', [])
+            if re.search(r'(?<!\w)' + re.escape(c['name']) + r'(?!\w)', text, re.I)]
+
+
+def photo_reply_assignments(text: str, plan: dict, draft: dict,
+                            *, allow_single_answer: bool = False) -> dict[int, str]:
+    """Resolve explicit author photo-to-character pairs without another LLM call.
+
+    Do not use a lone name unless the bot *just asked* who owns one photo.
+    Do not resolve pronouns, infer visual identity, or invent characters.
+    """
+    photos = {int(p['index']): p for p in draft.get('photos', [])}
+    if not photos:
+        return {}
+    mappings = {}
+    # Multiple photos may be described in one sentence: "первая Кирай, вторая Авинель".
+    for clause in re.split(r'[,;\n]+', text):
+        numbers = list(_PHOTO_NUMBER.finditer(clause))
+        matches = _character_mentions(clause, plan)
+        if len(numbers) != 1 or len(matches) != 1:
+            continue
+        label = numbers[0].group('number').casefold()
+        number = int(label) if label.isdecimal() else _ORDINALS.get(label)
+        if number in photos and not re.search(r'\bне\s+' + re.escape(matches[0]) + r'\b', clause, re.I):
+            mappings[number] = matches[0]
+    if mappings or not allow_single_answer:
+        return mappings
+    unassigned = [int(p['index']) for p in draft.get('photos', [])
+                  if p.get('character', '').casefold() not in
+                  {c['name'].casefold() for c in plan.get('characters', [])}
+                  and int(p['index']) not in {x['index'] for x in plan.get('photos', [])}]
+    if len(unassigned) != 1 or len(text) > 85 or '\n' in text:
+        return {}
+    matches = _character_mentions(text, plan)
+    if len(matches) != 1 or re.search(r'\bне\s+' + re.escape(matches[0]) + r'\b', text, re.I):
+        return {}
+    # Accept "Кирай", "это Кирай", "первая — Кирай". A long scene description
+    # containing her name is not an unambiguous assignment.
+    cleaned = re.sub(r'[.,!?«»"\s—–-]', '', text.casefold())
+    if cleaned in (matches[0].casefold(), 'это' + matches[0].casefold(),
+                   'фото' + matches[0].casefold(), 'портрет' + matches[0].casefold()):
+        return {unassigned[0]: matches[0]}
+    if _PHOTO_NUMBER.search(text) and len(text) < 45:
+        return {unassigned[0]: matches[0]}
+    return {}
+
+
+def apply_author_photo_assignments(draft: dict, plan: dict) -> bool:
+    """Record explicit pairs from the notes; later notes override earlier ones."""
+    chosen = {}
+    for offset, note in enumerate(draft.get('notes', []), start=1):
+        for index, character in photo_reply_assignments(note, plan, draft).items():
+            chosen[index] = (character, offset)
+    changed = False
+    for photo in draft.get('photos', []):
+        number = int(photo['index'])
+        if number not in chosen:
+            continue
+        character, offset = chosen[number]
+        # A subsequent direct answer to the clarification outranks all older
+        # notes; only a later explicit correction can replace that answer.
+        if offset <= int(photo.get('assigned_after_notes', 0)):
+            continue
+        if photo.get('character') != character:
+            photo['character'] = character
+            changed = True
+        photo['assigned_after_notes'] = offset
+    return changed
 
 
 def validate_plan(raw: dict, photos: list) -> dict:
@@ -255,6 +346,16 @@ def validate_plan(raw: dict, photos: list) -> dict:
         matching = next((i['name'] for i in result['characters'] if i['name'].casefold() == c.casefold()), None)
         if n in photo_by_index and matching and n not in [r['index'] for r in result['photos']]:
             result['photos'].append({'index': n, 'character': matching})
+    # The author's explicit association is authoritative, including across
+    # restarts and repeated extractions with different models.
+    known = {c['name'].casefold(): c['name'] for c in result['characters']}
+    by_number = {p['index']: p['character'] for p in result['photos']}
+    for photo in photos:
+        person = known.get(str(photo.get('character') or '').casefold())
+        if person:
+            by_number[int(photo['index'])] = person
+    result['photos'] = [{'index': i, 'character': by_number[i]}
+                        for i in sorted(by_number)]
     return result
 
 
