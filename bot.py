@@ -12,6 +12,7 @@ from aiogram.types import BufferedInputFile, FSInputFile, Message, CallbackQuery
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+from typing_status import typing_during
 from engine import RoleplayEngine
 from storage import Store
 from db_safety import resolve_database_path
@@ -55,6 +56,8 @@ HELP = (
     '/begin — бот первым пишет начало текущей истории\n'
     '/opening — ещё раз показать первый пост (без перегенерации)\n'
     '/sessions — список историй\n'
+    '/worlds — миры, общий канон и энциклопедия\n'
+    'Анкеты: кнопка «👤 Персонажи»\n'
     '/switch ID — выбрать историю\n'
     '/world Описание — мир и законы (заменить)\n'
     '/cast Описание — распределение персонажей (заменить)\n'
@@ -334,9 +337,9 @@ async def start_story(message: Message, user_id: int, requested_sid=None):
         if db.recent_turns(sid, 1):
             await message.answer('Эта история уже началась. Нельзя создавать новый первый пост поверх сыгранных ходов.')
             return
-        await message.bot.send_chat_action(message.chat.id, 'typing')
         try:
-            opening, inp, out = await engine.generate_opening(sid)
+            async with typing_during(message.bot, message.chat.id):
+                opening, inp, out = await engine.generate_opening(sid)
             db.add_opening(sid, opening, engine.last_generation_model, inp, out)
         except Exception:
             log.exception('Opening generation or persistence failed')
@@ -410,9 +413,9 @@ async def play(message: Message, post: str, user_id: int | None = None):
             await message.answer('Сначала я должен написать первый пост. Нажми «✒️ Начать» в нижней панели '
                                  'или в меню. Твой текст не потерян: отправь его после начала истории.')
             return False
-        await message.bot.send_chat_action(message.chat.id, 'typing')
         try:
-            answer, inp, out = await engine.generate(session['id'], post)
+            async with typing_during(message.bot, message.chat.id):
+                answer, inp, out = await engine.generate(session['id'], post)
         except Exception:
             log.exception('Text generation failed')
             await message.answer('Не удалось получить ответ от API. Ход не сохранён; '
@@ -473,6 +476,8 @@ async def main():
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
     from interface import register_interface
+    from world_ui import register_world_ui
+    dp.include_router(await register_world_ui(db, OWNER))
     dp.include_router(await register_interface(db, engine, OWNER, start_story, play))
     dp.include_router(router)
     await dp.start_polling(bot)

@@ -5,16 +5,19 @@ import sqlite3
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from worlds import WorldMixin
 
 log = logging.getLogger(__name__)
 
 
-class Store:
+class Store(WorldMixin):
     def __init__(self, path: str):
         self.path = str(Path(path))
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._backup_before_migration()
         self.init_db()
+        self._backup_before_world_migration()
+        self.init_worlds()
 
     def make_backup(self) -> Path:
         """Consistent hot snapshot; does not alter or move live SQLite."""
@@ -60,6 +63,21 @@ class Store:
                 destination.unlink(missing_ok=True)
                 raise
             log.warning('Created pre-migration SQLite backup: %s', destination)
+
+    def _backup_before_world_migration(self):
+        with self.connect() as db:
+            version = db.execute('PRAGMA user_version').fetchone()[0]
+            migrated = 'world_id' in {r['name'] for r in db.execute('PRAGMA table_info(sessions)')}
+            if version >= 6 and migrated:
+                return
+            has_stories = db.execute('SELECT EXISTS(SELECT 1 FROM sessions)').fetchone()[0]
+            if not has_stories:
+                return
+            check = db.execute('PRAGMA quick_check').fetchone()[0]
+            if check != 'ok':
+                raise RuntimeError('SQLite integrity check failed: ' + str(check))
+        snap = self.make_backup()
+        log.warning('Pre-v0.6 migration SQLite snapshot: %s', snap)
 
     def connect(self):
         db = sqlite3.connect(self.path)
@@ -169,7 +187,8 @@ class Store:
                 );
             ''')
             self._ensure_fts(db)
-            db.execute('PRAGMA user_version=4')
+            if db.execute('PRAGMA user_version').fetchone()[0] < 4:
+                db.execute('PRAGMA user_version=4')
 
     def _ensure_fts(self, db):
         """Indexed search of old turns. Gracefully degrade if SQLite lacks FTS5."""
@@ -430,13 +449,29 @@ class Store:
         if role not in ('user', 'bot', 'npc') or not (1 <= len(name.strip()) <= 80):
             raise ValueError('invalid character')
         with self.connect() as db:
-            cursor = db.execute('INSERT INTO characters(session_id,name,role) VALUES (?,?,?)',
-                                (sid, name.strip(), role))
-            return cursor.lastrowid
+            world = db.execute('SELECT world_id FROM sessions WHERE id=?', (sid,)).fetchone()
+            if not world:
+                raise ValueError('unknown story')
+            # Reuse a world's library character instead of creating contradictory twins.
+            if world['world_id'] is not None:
+                existing = next((c for c in db.execute(
+                    'SELECT name FROM characters WHERE world_id=?', (world['world_id'],))
+                    if c['name'].casefold() == name.strip().casefold()), None)
+                if existing:
+                    raise ValueError('Герой с таким именем уже есть в библиотеке мира. Добавь его через «Жители мира».')
+            cursor = db.execute('INSERT INTO characters(session_id,name,role,world_id) VALUES (?,?,?,?)',
+                                (sid, name.strip(), role, world['world_id']))
+            cid = cursor.lastrowid
+            db.execute('INSERT INTO story_characters(session_id,character_id,role) VALUES (?,?,?)',
+                       (sid,cid,role))
+            return cid
 
     def list_characters(self, sid: int):
         with self.connect() as db:
-            return db.execute('SELECT * FROM characters WHERE session_id=? ORDER BY name COLLATE NOCASE', (sid,)).fetchall()
+            return db.execute('''SELECT c.id,c.session_id,c.name,sc.role AS role,c.description,
+                c.appearance_override,c.created_at,c.world_id FROM story_characters sc
+                JOIN characters c ON c.id=sc.character_id WHERE sc.session_id=?
+                ORDER BY c.name COLLATE NOCASE''', (sid,)).fetchall()
 
     def get_character(self, cid: int):
         with self.connect() as db:
@@ -446,7 +481,17 @@ class Store:
         if role not in ('user', 'bot', 'npc'):
             raise ValueError('unknown role')
         with self.connect() as db:
+            # Role is story-specific. Update memberships of a legacy single-story
+            # character only; the UI uses set_story_character_role instead.
             db.execute('UPDATE characters SET role=? WHERE id=?', (role, cid))
+            db.execute('UPDATE story_characters SET role=? WHERE character_id=?', (role, cid))
+
+    def set_story_character_role(self, sid: int, cid: int, role: str):
+        if role not in ('user', 'bot', 'npc'):
+            raise ValueError('unknown role')
+        with self.connect() as db:
+            db.execute('UPDATE story_characters SET role=? WHERE session_id=? AND character_id=?',
+                       (role,sid,cid))
 
     def set_character_text(self, cid: int, field: str, value: str):
         if field not in ('description', 'appearance_override'):
@@ -510,5 +555,9 @@ class Store:
             if not record:
                 return []
             photos = db.execute('SELECT local_path FROM character_photos WHERE character_id=?', (cid,)).fetchall()
+            in_world = db.execute('SELECT world_id FROM characters WHERE id=?', (cid,)).fetchone()
+            db.execute('DELETE FROM story_characters WHERE session_id=? AND character_id=?', (sid,cid))
+            if in_world and in_world['world_id'] is not None:
+                return []  # Shared library character: do not delete its sheet or photos.
             db.execute('DELETE FROM characters WHERE id=? AND session_id=?', (cid, sid))
             return [row['local_path'] for row in photos]

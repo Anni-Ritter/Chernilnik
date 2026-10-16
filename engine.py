@@ -10,6 +10,7 @@ from storage import Store
 from prompting import PromptComposer
 from memory import EXTRACT_INSTRUCTIONS, extraction_prompt, select_memories, validated_extractions, save_extractions
 from generation_models import GenerationChoice, GenerationSettings
+from worlds import PROFILE_FIELDS
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,18 @@ class RoleplayEngine:
             sections = [f"{char['name']} ({role})"]
             if char['description']:
                 sections.append('Биография/характер от автора: ' + char['description'][:3500])
+            fields = self.db.profile_fields(char['id'], sid)
+            if fields:
+                sections.append('АНКЕТА (≈ обозначает интерпретацию, не установленную истину):')
+                for f in fields[:22]:
+                    mark = ' ≈ гипотеза' if f['certainty'] != 'confirmed' else ''
+                    sections.append(f'{PROFILE_FIELDS.get(f["field"],f["field"])}: {f["value"][:380]}{mark}')
+            history = self.db.development(char['id'],sid,8)
+            if history:
+                sections.append('РАЗВИТИЕ В ЭТОМ СЮЖЕТЕ, подтверждено фрагментами ходов:')
+                for item in reversed(history):
+                    prefix = 'НАБЛЮДЕНИЕ' if item['certainty']=='confirmed' else 'ВОЗМОЖНОЕ ОБЪЯСНЕНИЕ, НЕ ФАКТ'
+                    sections.append(prefix + ': ' + item['insight'][:310])
             if char['appearance_override']:
                 sections.append('Внешность (уточнение автора выше приоритетом): ' + char['appearance_override'][:1900])
             for photo in self.db.photos(char['id'])[:5]:
@@ -136,7 +149,13 @@ class RoleplayEngine:
         if not self.auto_memory:
             return 0
         old_facts = select_memories(self.db.list_facts(sid), post + '\n' + answer, max_chars=5500)
-        prompt = extraction_prompt(post, answer, old_facts)
+        cast = self.db.list_characters(sid)
+        roster = '\n'.join(f"{c['name']}: {('герой игрока' if c['role']=='user' else 'герой бота')}"
+                           for c in cast)
+        world = self.db.get_world(self.db.get_session(sid)['world_id']) if self.db.get_session(sid)['world_id'] else None
+        prompt = (extraction_prompt(post, answer, old_facts)
+                  + '\n\nАКТИВНЫЕ ГЕРОИ (учитывай только этот список для анкеты):\n' + roster
+                  + '\nМИР: ' + (world['name'] if world else 'не привязан'))
         response = await self.client.responses.create(
             model=self.memory_model, instructions=EXTRACT_INSTRUCTIONS, input=prompt,
             max_output_tokens=1200, store=False,
@@ -149,4 +168,41 @@ class RoleplayEngine:
         data = json.loads(response.output_text or '{}')
         validated = validated_extractions(data, post + '\n' + answer)
         save_extractions(self.db, sid, turn_id, validated)
+        source_text = post + '\n' + answer
+        # World changes are exceptional: only evidence-backed, objective facts;
+        # unverified rumours are not promoted into global canon.
+        if world and isinstance(data.get('world_changes'), list):
+            for item in data['world_changes'][:2]:
+                if not isinstance(item,dict):
+                    continue
+                evidence = str(item.get('evidence','')).strip()
+                statement = str(item.get('text','')).strip()
+                if (evidence and evidence in source_text and 12 <= len(statement) <= 500
+                        and item.get('certainty') == 'confirmed'):
+                    self.db.add_world_event(world['id'],statement,sid,turn_id,evidence,status='confirmed')
+        if isinstance(data.get('character_insights'),list):
+            names = {c['name'].casefold():c for c in cast}
+            for item in data['character_insights'][:5]:
+                if not isinstance(item,dict):
+                    continue
+                target = names.get(str(item.get('name','')).strip().casefold())
+                text = str(item.get('text','')).strip()
+                evidence = str(item.get('evidence','')).strip()
+                certainty = item.get('certainty','interpretation')
+                field = str(item.get('field','')).strip()
+                if (not target or not evidence or evidence not in source_text
+                        or not 10 <= len(text) <= 500 or certainty not in ('confirmed','interpretation')):
+                    continue
+                if target['role']=='user' and (certainty!='confirmed' or field in
+                    ('fears','defenses','attachments','conflicts','self_image','goals')):
+                    # No speculative inner life for the player's character.
+                    continue
+                self.db.add_development(target['id'],sid,turn_id,text,evidence,certainty)
+                if field in PROFILE_FIELDS and target['role'] != 'user':
+                    # A story-local working sheet; never overwrite an author profile.
+                    current = self.db.profile_fields(target['id'],sid)
+                    author_fields = {f['field'] for f in current if f['session_id']==0}
+                    if field not in author_fields and certainty=='confirmed':
+                        self.db.set_profile_field(target['id'],field,text,sid=sid,
+                                                  source='model',certainty='confirmed',evidence=evidence)
         return len(validated)

@@ -66,8 +66,8 @@ def test_compiled_prompt_includes_examples_facts_and_chronology(tmp_path):
     result = composer(db).assemble(sid, 'Ирис спросила, кто её похитил.')
     assert 'Винсент похитил Ирис' in result.user
     assert 'День 3 зимы' in result.user
-    assert 'Леон уже около недели ходит' in result.user  # exemplar, NOT canon
-    assert 'НЕ события текущего мира' in result.user
+    assert 'Встроенные примеры отключены' in result.user  # user deleted examples; no hidden fallback
+    assert 'НЕ события текущего мира' not in result.user
     assert 'Ирис спросила' in result.user
     assert 'тряпк' not in result.system
     assert 'Не добавляй шуток по расписанию' in result.system
@@ -119,7 +119,7 @@ def test_engine_one_generation_and_debug_no_extra_api_calls(tmp_path, monkeypatc
     assert (body, before, after) == ('Винсент молчал.', 10, 7)
     assert len(responses.calls) == 1
     assert 'Винсент молчал' not in responses.calls[0]['input']
-    assert 'ОБРАЗЦЫ ЛИТЕРАТУРНОЙ МАНЕРЫ' in responses.calls[0]['input']
+    assert 'Встроенные примеры отключены' in responses.calls[0]['input']
     trace = db.get_prompt_audit(sid)
     assert '=== SYSTEM / INSTRUCTIONS ===' in trace['prompt_text']
     assert 'Ирис вошла.' in trace['prompt_text']

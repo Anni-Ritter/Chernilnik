@@ -41,8 +41,9 @@ DRAFT_KEYS = ReplyKeyboardMarkup(keyboard=[
 
 MAIN_KEYS = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text='🗂 Меню'), KeyboardButton(text='📖 Истории')],
-        [KeyboardButton(text='👤 Персонажи'), KeyboardButton(text='✒️ Начать')],
+        [KeyboardButton(text='📚 Миры'), KeyboardButton(text='📖 Истории')],
+        [KeyboardButton(text='👤 Персонажи'), KeyboardButton(text='🗂 Меню')],
+        [KeyboardButton(text='✒️ Начать')],
     ], resize_keyboard=True, input_field_placeholder='Ролевой пост или кнопка меню',
 )
 
@@ -56,8 +57,9 @@ def keyboard(rows):
 
 def main_menu():
     return keyboard([
-        [('📖 Истории', 'ui:sessions'), ('👤 Персонажи', 'ui:characters')],
-        [('🌍 Мир и сцена', 'ui:scene'), ('🧠 Память', 'ui:memory')],
+        [('🌍 Миры', 'w:home'), ('📖 Истории', 'ui:sessions')],
+        [('👤 Персонажи', 'ui:characters'), ('📋 Анкеты', 'w:profiles')],
+        [('🎭 Сцена и роли', 'ui:scene'), ('🧠 Память', 'ui:memory')],
         [('🎨 Стиль и примеры', 'ui:style'), ('🤖 Модель текста', 'ui:model')],
         [('✒️ Первый пост', 'ui:begin'), ('📝 Длинный пост', 'ui:draft')],
         [('📦 Экспорт', 'ui:export'), ('📊 Статус', 'ui:status')],
@@ -94,7 +96,7 @@ def model_menu(engine):
 
 def scene_menu():
     return keyboard([
-        [('📜 Описание мира', 'ui:field:world'), ('🎭 Распределение ролей', 'ui:field:cast')],
+        [('📜 Уточнения сюжета', 'ui:field:world'), ('🎭 Распределение ролей', 'ui:field:cast')],
         [('🕰 Время', 'ui:field:scene_time'), ('📍 Локация', 'ui:field:current_location')],
         [('← Главное меню', 'ui:home')],
     ])
@@ -103,11 +105,12 @@ def scene_menu():
 def character_menu(cid: int):
     return keyboard([
         [('🖼 Фотографии', f'ui:photos:{cid}'), ('➕ Фото', f'ui:upload:{cid}')],
+        [('📋 Полная анкета', f'w:sheet:{cid}')],
         [('📝 Характер и биография', f'ui:editbio:{cid}')],
         [('✏️ Переименовать', f'ui:rename:{cid}')],
         [('✏️ Уточнить внешность', f'ui:editlook:{cid}')],
         [('🎭 Кто отыгрывает', f'ui:roles:{cid}')],
-        [('🗑 Удалить персонажа', f'ui:delchar:{cid}')],
+        [('🔗 Убрать из этой истории', f'ui:delchar:{cid}')],
         [('← Персонажи', 'ui:characters')],
     ])
 
@@ -127,7 +130,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
 
     def active_char(cid, user_id):
         char = db.get_character(cid)
-        return char if char is not None and char['session_id'] == active(user_id)['id'] else None
+        return char if char is not None and db.story_has_character(active(user_id)['id'], cid) else None
 
     async def show_menu(message: Message, user_id: int):
         session = active(user_id)
@@ -137,7 +140,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
 
     async def show_sessions(message: Message, user_id: int):
         active_id = active(user_id)['id']
-        rows = [[('➕ Новая история', 'ui:new')]]
+        rows = [[('➕ Новая история', 'w:storyworld')]]
         for s in db.list_sessions()[:25]:
             title = s['title'][:33]
             rows.append([(('✅ ' if s['id'] == active_id else '📖 ') + title, f'ui:session:{s["id"]}')])
@@ -167,7 +170,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         rows.append([('← Меню', 'ui:home')])
         await message.answer('👤 Персонажи текущей истории.\n'
                              '👤 — твой герой; ✒️ — герой бота; 🎭 — NPC.\n'
-                             'Фотографии и описания не переходят в другие истории.',
+                             'Анкеты и внешность живут в библиотеке мира; сюжетные воспоминания разделены.',
                              reply_markup=keyboard(rows))
 
     async def show_character(message: Message, cid: int, user_id: int):
@@ -177,7 +180,8 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             return
         photos = db.photos(cid)
         active_pic = next((p for p in photos if p['is_primary']), None)
-        role = {'user': 'Твой персонаж', 'bot': 'Персонаж соавтора', 'npc': 'NPC соавтора'}[ch['role']]
+        story_char = next((c for c in db.list_characters(active(user_id)['id']) if c['id'] == cid), ch)
+        role = {'user': 'Твой персонаж', 'bot': 'Персонаж соавтора', 'npc': 'NPC соавтора'}[story_char['role']]
         bio = ch['description'][:1300] or 'Пока без описания'
         author_look = ch['appearance_override'][:700] or 'Нет'
         ai_look = (active_pic['visual_description'][:1100] if active_pic and active_pic['visual_description'] else 'Нет')
@@ -364,9 +368,11 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         elif action == 'sessions':
             await show_sessions(message, uid)
         elif action == 'new':
-            await state.set_state(Editing.story_title)
-            await message.answer('📖 Как назовём историю? Пришли название одним сообщением.\n'
-                                 'Для отмены нажми «🗂 Меню».')
+            from world_ui import kb
+            rows = [[('🌿 Свободная', 'w:storynew:0')]]
+            rows += [[('🌍 ' + w['name'][:40], f'w:storynew:{w["id"]}')] for w in db.list_worlds()[:30]]
+            rows += [[('➕ Создать мир', 'w:new')]]
+            await message.answer('В каком мире будет история?', reply_markup=kb(rows))
         elif action == 'session' and arg.isdigit():
             if db.switch_session(uid, int(arg)):
                 await message.answer(f'✅ Активна история «{active(uid)["title"]}».',
@@ -389,20 +395,20 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         elif action == 'delchar' and arg.isdigit():
             ch = active_char(int(arg), uid)
             if ch:
-                await message.answer(f'Точно удалить «{ch["name"]}» и все его референсы? '
-                                     'Ролевые посты останутся в истории.', reply_markup=keyboard([
-                    [('🗑 Да, удалить', f'ui:delcharyes:{arg}')],
+                await message.answer(f'Убрать «{ch["name"]}» из этой истории? '
+                                     'В общем мире его анкета, биография и фотографии останутся.', reply_markup=keyboard([
+                    [('🔗 Да, убрать', f'ui:delcharyes:{arg}')],
                     [('← Не удалять', f'ui:char:{arg}')],
                 ]))
         elif action == 'delcharyes' and arg.isdigit():
             ch = active_char(int(arg), uid)
             if ch:
-                paths = db.delete_character(ch['session_id'], ch['id'])
+                paths = db.delete_character(active(uid)['id'], ch['id'])
                 for item in paths:
                     p = Path(item)
                     if p.parent.resolve() == media_dir.resolve():
                         p.unlink(missing_ok=True)
-                await message.answer('🗑 Персонаж и его фото удалены. Сыгранные посты не изменены.')
+                await message.answer('✅ Участие в истории убрано. Общие анкеты и фото не удалены, если герой принадлежит миру.')
                 await show_characters(message, uid)
         elif action == 'roles' and arg.isdigit():
             ch = active_char(int(arg), uid)
@@ -415,7 +421,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         elif action == 'setrole' and arg.isdigit() and len(parts) == 4:
             ch = active_char(int(arg), uid)
             if ch and parts[3] in ('user', 'bot', 'npc'):
-                db.set_character_role(ch['id'], parts[3])
+                db.set_story_character_role(active(uid)['id'], ch['id'], parts[3])
                 await show_character(message, ch['id'], uid)
         elif action in ('editbio', 'editlook') and arg.isdigit():
             ch = active_char(int(arg), uid)
@@ -468,8 +474,10 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
                 await show_photos(message, photo['character_id'], uid)
         elif action == 'scene':
             session = active(uid)
+            shared_world = db.get_world(session['world_id']) if session['world_id'] else None
             await message.answer(f'🌍 Мир и сцена · {session["title"]}\n\n'
-                                 f'Мир: {(session["world"] or "не задан")[:200]}\n'
+                                 f'Общий мир: {shared_world["name"] if shared_world else "не привязан"}\n'
+                                 f'Уточнения сюжета: {(session["world"] or "нет")[:200]}\n'
                                  f'Роли: {(session["cast"] or "не заданы")[:220]}\n'
                                  f'Время: {session["scene_time"] or "не задано"}\n'
                                  f'Локация: {session["current_location"] or "не задана"}',
@@ -477,7 +485,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         elif action == 'field' and arg in ('world', 'cast', 'scene_time', 'current_location'):
             await state.set_state(Editing.field)
             await state.update_data(field=arg, session_id=active(uid)['id'])
-            label = {'world': 'описание мира', 'cast': 'распределение ролей',
+            label = {'world': 'уточнения только этого сюжета', 'cast': 'распределение ролей',
                      'scene_time': 'время и сезон', 'current_location': 'место действия'}[arg]
             await message.answer(f'✏️ Пришли {label} одним сообщением. Старое значение будет заменено.\n'
                                  'Для отмены нажми «🗂 Меню».')
@@ -602,13 +610,16 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             return
         try:
             cid = db.add_character(active(message.from_user.id)['id'], name)
-        except sqlite3.IntegrityError:
-            await message.answer('Персонаж с таким именем уже существует в этой истории. Дай другое имя.')
+        except (sqlite3.IntegrityError, ValueError) as exc:
+            await message.answer(str(exc) if isinstance(exc, ValueError) else
+                                 'Персонаж с таким именем уже существует в этой истории. Дай другое имя.')
             return
         await state.clear()
-        await message.answer('✅ Персонаж создан. Выбери, кто его отыгрывает:', reply_markup=keyboard([
+        await message.answer('✅ Персонаж создан. Выбери, кто его отыгрывает.\n'
+                             'Анкету и фото можно заполнить сейчас или позже.', reply_markup=keyboard([
             [('👤 Я', f'ui:setrole:{cid}:user'), ('✒️ Бот', f'ui:setrole:{cid}:bot')],
             [('🎭 NPC', f'ui:setrole:{cid}:npc')],
+            [('📋 Открыть анкету', f'w:sheet:{cid}')],
         ]))
 
     @router.message(Editing.character_rename, F.text)

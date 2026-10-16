@@ -68,7 +68,9 @@ class PromptComposer:
         # Live personal examples are stored in the durable SQLite database, not
         # code or FSM state; changes in Telegram take effect without redeploying.
         personalized = [dict(text=row['text'], tags=[]) for row in self.db.list_style_examples()]
-        for index, item in enumerate(personalized + self._examples):
+        if not personalized:
+            return ''  # Deleting every example really disables them; no bundled fallback.
+        for index, item in enumerate(personalized):
             # User-added examples take precedence over bundled starter examples.
             priority = 1000 if index < len(personalized) else 0
             tag_match = len(tokens(' '.join(item.get('tags', []))) & qt)
@@ -111,9 +113,27 @@ class PromptComposer:
                              f"СОАВТОР: {trim(turn['bot_text'], 1150)}")
 
         memories = select_memories(self.db.list_facts(sid), query, max_chars=7500, max_items=35)
+        world = self.db.get_world(session['world_id']) if session['world_id'] else None
+        global_canon = ''
+        if world:
+            global_canon = f"МИР «{world['name']}» (общая энциклопедия):\n" + trim(world['description'], 7500)
+            events = self.db.list_world_events(world['id'], limit=24)
+            if events:
+                global_canon += ('\n\nОБЩИЕ ГЛОБАЛЬНЫЕ СОБЫТИЯ (не автоматически знания каждого героя; '
+                                 'для параллельных историй сверяй время):\n'
+                                 + '\n'.join('• ' + e['text'] for e in reversed(events)))
+        if world:
+            search_query = (session['title'] + ' ' + session['current_location'] + ' ' +
+                            session['scene_time'] + ' ' + (post or '')[:1100] + ' ' +
+                            self.character_context(sid)[:2700])
+            relevant_lore = self.db.relevant_world_lore(world['id'], search_query)
+            if relevant_lore:
+                global_canon += '\n\nРЕЛЕВАНТНЫЕ СТАТЬИ ЭНЦИКЛОПЕДИИ:\n' + '\n\n'.join(relevant_lore)
+        if session['world']:
+            global_canon += ('\n\nУТОЧНЕНИЯ ИМЕННО ЭТОГО СЮЖЕТА:\n' + trim(session['world'], 3000))
         parts = [
             ('СЕССИЯ', trim(session['title'], 150)),
-            ('МИР (заданные автором правила)', trim(session['world'], 3800) or
+            ('МИР (общий канон и сюжетные уточнения)', global_canon or
              'Свободная история: не придумывай фундаментальные законы мира без сюжетной необходимости.'),
             ('РАСПРЕДЕЛЕНИЕ РОЛЕЙ', trim(session['cast'], 2200) or
              'Игрок контролирует собственных героев. Соавтор контролирует своих персонажей, NPC и окружение.'),
@@ -144,7 +164,7 @@ class PromptComposer:
             # Keep the NEW user post and pinned facts intact even for gigantic worlds.
             shrink = ['ПРИМЕРЫ ЖЕЛАЕМОЙ ПРОЗЫ', 'ПОИСК В СТАРЫХ ПОСТАХ', 'ПОСЛЕДНИЕ ХОДЫ',
                       'КАРТОЧКИ ПЕРСОНАЖЕЙ (включая СКРЫТЫЕ ОТ ГЕРОЕВ сведения)',
-                      'МИР (заданные автором правила)']
+                      'МИР (общий канон и сюжетные уточнения)']
             index_map = {name: i for i, (name, _) in enumerate(parts)}
             for key in shrink:
                 if len(text) <= self.max_chars:
