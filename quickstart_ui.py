@@ -21,6 +21,7 @@ from quickstart_core import (QuickDrafts, EXTRACT_SYSTEM, setup_prompt,
                              decode_json, validate_plan, need_clarification,
                              find_world, wants_start, wants_new_story, install_plan)
 from typing_status import typing_during
+from setup_dialogue import (generate_setup_reply, save_assistant_reply, is_discussion_only)
 from vision import image_info, MAX_IMAGE_BYTES, describe_image
 
 log = logging.getLogger(__name__)
@@ -60,14 +61,33 @@ async def register_quickstart(db, engine, owner: int, begin_story):
             return
         wid = find_world(seed, db.list_worlds()) if seed else None
         draft = drafts.start(uid, wid, title=title, seed=seed)
-        if draft['world_id'] is None:
-            await message.answer('Затеваем новую историю! В каком мире играем?\n'
-                                 'Выбери мир ниже или напиши его название. Можно и без общего мира.',
-                                 reply_markup=world_picker(db))
+        if seed:
+            # The author already started a conversation; respond to the idea,
+            # don't interrupt with a canned world-selection questionnaire.
+            await respond(message, uid, seed)
+        elif draft['world_id'] is None:
+            await message.answer('Расскажи, что задумала. Если нужно, уточню мир и героев '
+                                 'по ходу разговора. Можно присылать портреты; '
+                                 'начну историю по слову «погнали».')
         else:
-            await message.answer('Мир поняла. Рассказывай идею, кто твои герои, кто мои. '
-                                 'Можно несколькими сообщениями и картинками.\n'
-                                 'Когда всё расскажешь — просто напиши «погнали».')
+            await message.answer('Мир выбран. Рассказывай идею свободно, '
+                                 'можно с картинками и уточнениями.')
+
+    async def respond(message: Message, uid: int, latest: str, *, is_photo: bool = False):
+        """The assistant talks about the *actual* idea, without writing story canon."""
+        draft = drafts.get(uid)
+        if draft is None:
+            return
+        try:
+            async with typing_during(message.bot, message.chat.id):
+                reply = await generate_setup_reply(engine, db, draft, latest, is_photo=is_photo)
+        except Exception:
+            log.exception('Conversational setup reply failed')
+            await message.answer('Я сохранила сообщение в черновике, но сейчас не смогла '
+                                 'нормально на него ответить. Можешь продолжать — ничего не потерялось.')
+            return
+        save_assistant_reply(drafts, uid, reply)
+        await message.answer(reply)
 
     async def select_world(message: Message, uid: int, wid: int):
         if wid > 0 and not db.get_world(wid):
@@ -88,11 +108,9 @@ async def register_quickstart(db, engine, owner: int, begin_story):
         draft['phase'] = 'collect'
         drafts.save(uid, draft)
         world = db.get_world(wid) if wid else None
-        await message.answer(f'Отлично, {world["name"] if world else "играем без общего мира"}.\n\n'
-                             'Рассказывай свободно: «Авинель — твоя, она такая-то. '
-                             'Кирай — моя. Хочу начать с...». '
-                             'Портреты можно присылать следом или с подписью.\n\n'
-                             'Я всё соберу. Когда будешь готова — «погнали».')
+        await message.answer(f'{world["name"] if world else "Свободный мир"} — принято. '
+                             'Можешь рассказывать сюжет и героев просто как в разговоре. '
+                             'Я учту детали; никаких анкет заполнять не нужно.')
 
     async def extract(draft):
         # Setup uses the same selected literary provider, separate from OpenAI memory.
@@ -242,36 +260,36 @@ async def register_quickstart(db, engine, owner: int, begin_story):
             await message.answer('История уже подготовлена. «Погнали» повторит запуск, '
                                  'а /cancelsetup закроет подготовку.')
             return
+        if wants_start(text):
+            await finish(message, uid)
+            return
         if draft['phase'] == 'world':
             wid = find_world(text, db.list_worlds())
-            if text.casefold() in ('без мира','свободная история','свой мир','без общего мира'):
+            if text.casefold().strip(' .!') in ('без мира','свободная история','свой мир','без общего мира'):
                 wid = 0
-            if wid is None:
-                await message.answer('Не уверена, какой мир ты имеешь в виду. Выбери существующий '
-                                     'или «Без общего мира».',reply_markup=world_picker(db))
-            else:
-                matched = db.get_world(wid) if wid else None
-                if len(text) > len(matched['name'] if matched else 'без мира') + 15:
+            if wid is not None:
+                # Keep the story idea if the author also described characters in that message.
+                name = (db.get_world(wid)['name'] if wid else 'без общего мира')
+                if len(text) > len(name) + 15:
                     try:
-                        drafts.add_note(uid,text)
+                        drafts.add_note(uid, text)
                     except ValueError as err:
                         await message.answer(str(err))
                         return
-                await select_world(message,uid,wid)
-            return
-        if wants_start(text):
-            await finish(message,uid)
-            return
-        try:
-            drafts.add_note(uid,text)
-        except ValueError as err:
-            await message.answer(str(err))
-            return
-        if draft['phase'] == 'clarify':
-            await finish(message,uid)
-        else:
-            await message.answer('Слушаю, продолжай. Можно присылать картинки и уточнения. '
-                                 'Когда всё — «погнали».')
+                await select_world(message, uid, wid)
+                if len(text) > len(name) + 15:
+                    await respond(message, uid, text)
+                return
+        # Discussion/questions are answered, but they are not authorial story facts.
+        if not is_discussion_only(text):
+            try:
+                drafts.add_note(uid, text)
+            except ValueError as err:
+                await message.answer(str(err))
+                return
+        # In 'clarify' we stay conversational, not force extraction on every answer.
+        # At 'погнали' the canonical plan is validated and assembled in one pass.
+        await respond(message, uid, text)
 
     @router.message(StateFilter(None), F.photo | F.document)
     async def natural_photo(message: Message):
@@ -279,7 +297,7 @@ async def register_quickstart(db, engine, owner: int, begin_story):
             return
         uid = message.from_user.id
         draft = drafts.get(uid)
-        if not draft or draft['phase'] not in ('collect','clarify'):
+        if not draft or draft['phase'] not in ('world','collect','clarify'):
             await message.answer('Для референса персонажа начни подготовку через /new. '
                                  'В старой истории фото можно добавить через /menu → Персонажи.')
             return
@@ -304,7 +322,19 @@ async def register_quickstart(db, engine, owner: int, begin_story):
             await message.answer('Не смогла сохранить изображение: '+str(exc))
             return
         n=len(draft['photos'])
-        await message.answer(f'Референс №{n} сохранила. Если неочевидно, чей он, просто '
-                             'скажи имя персонажа. Одежда с картинки не считается постоянной.')
+        visual = ''
+        try:
+            async with typing_during(message.bot, message.chat.id):
+                visual, _, _ = await describe_image(
+                    engine.client, os.getenv('VISION_MODEL', 'gpt-6-luna'), raw,
+                    (message.caption or 'нового персонажа')[:80])
+            drafts.set_photo_analysis(uid, n, visual)
+        except Exception:
+            log.exception('Quickstart photo appearance extraction failed; photo retained')
+            drafts.set_photo_analysis(uid, n, '', failed=True)
+        notice = ('На фото №'+str(n)+' я выделила устойчивые черты внешности. '
+                  if visual else 'Фото №'+str(n)+' сохранила, но внешность пока не смогла разобрать. ')
+        await respond(message, uid, notice + (message.caption or 'Подскажи, чей это портрет, если не очевидно.'),
+                      is_photo=True)
 
     return router, drafts, welcome, world_picker

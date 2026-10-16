@@ -68,7 +68,7 @@ class QuickDrafts:
             return old
         data = {'version': 1, 'world_id': wid, 'phase': 'collect' if wid is not None else 'world',
                 'title': title[:100], 'notes': ([seed[:9000]] if seed else []), 'photos': [],
-                'session_id': None, 'needs_retry': False}
+                'session_id': None, 'needs_retry': False, 'assistant_replies': []}
         self.save(uid, data)
         return data
 
@@ -92,9 +92,20 @@ class QuickDrafts:
             raise ValueError('В одной подготовке поддерживается до 12 изображений.')
         data['photos'].append({'index': len(data['photos'])+1, 'file_id': file_id,
                                'path': path, 'caption': caption[:800],
-                               'near_text': '\n'.join(data['notes'][-2:])[-1200:]})
+                               'near_text': '\n'.join(data['notes'][-2:])[-1200:], 'analysis': ''})
         self.save(uid, data)
         return data
+
+    def set_photo_analysis(self, uid: int, index: int, analysis: str, *, failed: bool = False):
+        data = self.get(uid)
+        if data is None:
+            return
+        for item in data.get('photos', []):
+            if item['index'] == index:
+                item['analysis'] = analysis[:2500] if not failed else ''
+                item['analysis_error'] = bool(failed)
+                break
+        self.save(uid, data)
 
     def clear(self, uid: int):
         self._path(uid).unlink(missing_ok=True)
@@ -117,9 +128,10 @@ EXTRACT_SYSTEM = '''Ты технический разборщик авторс�
 
 def setup_prompt(data: dict) -> str:
     notes = '\n\n'.join(f'СООБЩЕНИЕ {i+1}:\n{item}' for i,item in enumerate(data['notes']))
-    images = '\n'.join(f'ФОТО {p["index"]}: подпись: {p["caption"]!r}; ближайший текст: {p["near_text"]!r}'
+    images = '\n'.join(f'ФОТО {p["index"]}: подпись: {p["caption"]!r}; ближайший текст: {p["near_text"]!r}; устойчивые визуальные признаки: {p.get("analysis", "")!r}'
                        for p in data['photos'])
-    return 'Описание автора для НОВОЙ ролевой:\n'+notes+'\n\n'+images+'\n\nОтветь JSON, не прозой.'
+    return ('Описание автора для НОВОЙ ролевой (последние исправления важнее ранних):\n'
+            + notes + '\n\n' + images + '\n\nОтветь JSON, не прозой.')
 
 
 def decode_json(raw: str) -> dict:
@@ -237,6 +249,8 @@ def install_plan(db, drafts: QuickDrafts, uid: int, draft: dict, plan: dict) -> 
         if cid and data and len(db.photos(cid)) < 5:
             already = any(p['telegram_file_id'] == data['file_id'] for p in db.photos(cid))
             if not already:
-                db.add_photo(cid,data['file_id'],data['path'],status='pending')
+                analysis = data.get('analysis') or ''
+                db.add_photo(cid, data['file_id'], data['path'],
+                             description=analysis, status='ok' if analysis else 'pending')
     return sid
 

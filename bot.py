@@ -118,13 +118,11 @@ async def cmd_start(message: Message):
     session = db.current_session(message.from_user.id)
     active_title = ('Сейчас открыта история «'+session['title']+'».\n') if session else ''
     await message.answer('✒️ Чернильник\n\n'+active_title+
-                         'Хочешь новую историю? Просто расскажи идею или выбери мир ниже. '
+                         'Хочешь новую историю? Просто расскажи идею или напиши /new. '
                          'Описание и картинки можно присылать несколькими сообщениями. '
                          '«Погнали» — и я начну.\n\n'
                          'Все настройки — в команде /menu.',
                          reply_markup=ReplyKeyboardRemove())
-    from quickstart_ui import world_picker
-    await message.answer('В каком мире начнём?', reply_markup=world_picker(db))
 
 
 @router.message(Command('help'))
