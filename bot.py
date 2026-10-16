@@ -8,7 +8,8 @@ import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BufferedInputFile, FSInputFile, Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (BufferedInputFile, FSInputFile, Message, CallbackQuery,
+                           InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardRemove)
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -50,32 +51,19 @@ engine.configure_generation(model_settings, polza_client)
 story_lock = asyncio.Lock()
 
 HELP = (
-    'Литературный соавтор · личный бот\n\n'
-    'Просто отправь пост — получишь продолжение без выбора вариантов.\n\n'
-    '/new Название — новая отдельная история\n'
-    '/begin — бот первым пишет начало текущей истории\n'
-    '/opening — ещё раз показать первый пост (без перегенерации)\n'
-    '/sessions — список историй\n'
-    '/worlds — миры, общий канон и энциклопедия\n'
-    'Анкеты: кнопка «👤 Персонажи»\n'
-    '/switch ID — выбрать историю\n'
-    '/world Описание — мир и законы (заменить)\n'
-    '/cast Описание — распределение персонажей (заменить)\n'
-    '/time Описание — зафиксировать время и сезон\n'
-    '/location Место — локация сцены\n'
-    '/remember Факт — закрепить критически важное\n'
-    '/memory — посмотреть долговременные факты\n'
-    '/draft — начать длинный пост по частям\n'
-    '/play — отправить накопленный пост\n'
-    '/cancel — удалить черновик поста\n'
-    '/last — повторно показать последний ответ (тех. восстановление)\n'
-    '/export — скачать историю в Markdown\n'
-    '/status — состояние и расход токенов\n'
-    '/prompt — показать последний запрос к модели (без генерации)\n'
-    '/model — выбрать модель литературных постов\n'
-    '/backup — скачать резервную копию SQLite\n'
-    '/id — узнать свой Telegram ID\n\n'
-    'Бот не перегенерирует игровые события. Каждый успешный ответ сразу становится ходом истории.'
+    '✒️ Чернильник — литературный соавтор.\n\n'
+    'Напиши «хочу новую историю» или /new. Я спрошу мир, выслушаю твою идею, '
+    'приму описание героев и портреты. Скажешь «погнали» — начну писать.\n\n'
+    '/new — начать новую историю разговором\n'
+    '/worlds — миры и энциклопедия\n'
+    '/sessions — выбрать существующую историю\n'
+    '/menu — все дополнительные настройки\n'
+    '/model — модель генерации\n'
+    '/backup — копия SQLite\n'
+    '/cancelsetup — отменить подготовку\n'
+    '/help — эта справка\n\n'
+    'В уже начатой истории обычные сообщения считаются ролевыми ходами. '
+    'Никаких перегенераций или выбора следующего события.'
 )
 
 
@@ -123,45 +111,61 @@ async def cmd_id(message: Message):
 
 
 @router.message(CommandStart())
-@router.message(Command('help'))
 async def cmd_start(message: Message):
     if not await ensure_access(message):
         return
-    session = current(message.from_user.id)
-    reply_markup = begin_keyboard(session['id']) if not db.get_opening(session['id']) and not db.recent_turns(session['id'], 1) else None
-    from interface import MAIN_KEYS, main_menu
-    await message.answer(f'✒️ Чернильник · твой литературный соавтор\n'
-                         f'Активная история #{session["id"]}: {session["title"]}.\n'
-                         'Обычные сообщения — ролевые посты. Открой меню кнопками ниже.',
-                         reply_markup=MAIN_KEYS)
-    await message.answer('Выбери, что настроить или открыть:', reply_markup=main_menu())
-    if reply_markup:
-        await message.answer('Когда настроишь героев, я могу первым начать историю.',
-                             reply_markup=reply_markup)
+    session = db.current_session(message.from_user.id)
+    active_title = ('Сейчас открыта история «'+session['title']+'».\n') if session else ''
+    await message.answer('✒️ Чернильник\n\n'+active_title+
+                         'Хочешь новую историю? Просто расскажи идею или выбери мир ниже. '
+                         'Описание и картинки можно присылать несколькими сообщениями. '
+                         '«Погнали» — и я начну.\n\n'
+                         'Все настройки — в команде /menu.',
+                         reply_markup=ReplyKeyboardRemove())
+    from quickstart_ui import world_picker
+    await message.answer('В каком мире начнём?', reply_markup=world_picker(db))
+
+
+@router.message(Command('help'))
+async def cmd_help(message: Message):
+    if await ensure_access(message):
+        await message.answer(HELP)
+
+
+@router.message(Command('menu'))
+async def cmd_menu(message: Message):
+    if not await ensure_access(message):
+        return
+    from interface import main_menu
+    await message.answer('⚙️ Дополнительные настройки Чернильника:',reply_markup=main_menu())
 
 
 @router.message(Command('new'))
 async def cmd_new(message: Message, command: CommandObject):
     if not await ensure_access(message):
         return
-    title = (command.args or '').strip()[:100] or 'Свободная история'
-    sid = db.new_session(message.from_user.id, title)
-    await message.answer(
-        f'Новая история #{sid}: {title}.\n'
-        'Сначала при желании задай /cast, /world, /time, /location.\n'
-        'Когда всё готово, нажми кнопку или отправь /begin: первый пост напишу я.',
-        reply_markup=begin_keyboard(sid),
-    )
+    # quick_welcome is bound during main() before polling starts.
+    if quick_welcome is None:
+        await message.answer('Подготовка ещё запускается. Попробуй ещё раз.')
+        return
+    await quick_welcome(message, message.from_user.id, title=(command.args or '').strip())
+
+
+quick_welcome = None
 
 
 @router.message(Command('sessions'))
 async def cmd_sessions(message: Message):
     if not await ensure_access(message):
         return
+    from interface import keyboard
     active = current(message.from_user.id)['id']
-    lines = [f'{"→" if row["id"] == active else "•"} #{row["id"]}: {row["title"]}'
-             for row in db.list_sessions()[:40]]
-    await message.answer('\n'.join(lines) + '\n\n/switch ID — перейти к истории')
+    rows = [[('✨ Новая история', 'qs:new')]]
+    for story in db.list_sessions()[:30]:
+        label = ('✅ ' if story['id'] == active else '📖 ') + story['title'][:44]
+        rows.append([(label, f'ui:session:{story["id"]}')])
+    rows.append([('← Меню','ui:home')])
+    await message.answer('📖 Выбери историю или начни новую.',reply_markup=keyboard(rows))
 
 
 @router.message(Command('switch'))
@@ -174,6 +178,10 @@ async def cmd_switch(message: Message, command: CommandObject):
         await message.answer('Формат: /switch 2')
         return
     ok = db.switch_session(message.from_user.id, sid)
+    if ok:
+        from quickstart_core import QuickDrafts
+        from pathlib import Path
+        QuickDrafts(Path(db.path).parent/'quickstarts').clear(message.from_user.id)
     await message.answer('История переключена.' if ok else 'Такой истории нет.')
 
 
@@ -477,9 +485,28 @@ async def main():
     dp = Dispatcher()
     from interface import register_interface
     from world_ui import register_world_ui
+    from quickstart_ui import register_quickstart
+    global quick_welcome
+    conversation_router, _drafts, quick_welcome, _world_picker = await register_quickstart(
+        db, engine, OWNER, start_story)
     dp.include_router(await register_world_ui(db, OWNER, engine))
+    dp.include_router(conversation_router)
     dp.include_router(await register_interface(db, engine, OWNER, start_story, play))
     dp.include_router(router)
+    # Telegram's slash-command menu replaces the permanently expanded keyboard.
+    try:
+        await bot.set_my_commands([
+            BotCommand(command='new', description='Новая история — просто расскажи идею'),
+            BotCommand(command='worlds', description='Миры и общий канон'),
+            BotCommand(command='sessions', description='Открыть другую историю'),
+            BotCommand(command='menu', description='Дополнительные настройки'),
+            BotCommand(command='model', description='Модель художественного текста'),
+            BotCommand(command='backup', description='Скачать копию базы'),
+            BotCommand(command='cancelsetup', description='Отменить подготовку истории'),
+            BotCommand(command='help', description='Справка'),
+        ])
+    except Exception:
+        log.exception('Telegram commands menu setup failed; regular slash commands still work')
     await dp.start_polling(bot)
 
 

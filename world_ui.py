@@ -82,7 +82,7 @@ async def register_world_ui(db, owner: int, engine=None):
     async def home(msg, uid, page=0):
         world_rows = db.list_worlds()
         page = min(max(0,page), max(0,(len(world_rows)-1)//8))
-        rows = [[('➕ Создать мир', 'w:new')], [('🌿 Без мира · свободные истории', 'w:storynew:0')]]
+        rows = [[('➕ Создать мир', 'w:new')], [('✨ Начать без мира', 'qs:world:0')]]
         for w in world_rows[page*8:page*8+8]:
             rows.append([(f'🌍 {w["name"][:40]} · 📖 {w["story_count"]} · 👤 {w["character_count"]}',
                           f'w:world:{w["id"]}')])
@@ -105,14 +105,15 @@ async def register_world_ui(db, owner: int, engine=None):
             await msg.answer('Мир не найден.')
             return
         desc = (world['description'] or 'Пока нет описания.')[:1700]
-        rows = [[('🤖 ИИ-импорт библии мира', f'w:import:{wid}')],
+        rows = [[('✨ Начать историю с идеи', f'qs:world:{wid}')],
+                [('🤖 ИИ-импорт библии мира', f'w:import:{wid}')],
                 *([[('⏯ Продолжить ИИ-импорт',f'w:importresume:{wid}')]]
                   if ImportDraft.latest(draft_root(db),wid) else []),
                 [('📜 Заменить канон', f'w:canon:{wid}'), ('➕ Дополнить', f'w:canonadd:{wid}')],
                 [('📚 Энциклопедия: страны и места', f'w:lore:{wid}')],
                 [('📥 Выгрузить канон', f'w:exportcanon:{wid}')],
                 [('🗞 События мира', f'w:events:{wid}'), ('👥 Жители', f'w:library:{wid}')],
-                [('➕ Новая история здесь', f'w:storynew:{wid}')]]
+                [('➕ Новая история здесь', f'qs:world:{wid}')]]
         stories = db.world_stories(wid)
         if active(uid)['world_id'] is None:
             rows.append([('🔗 Привязать текущую историю к миру', f'w:bind:{wid}')])
@@ -479,6 +480,9 @@ async def register_world_ui(db, owner: int, engine=None):
             await msg.answer(f'📖 Новая история · {name}\n\nКак её назовём?')
         elif action == 'openstory':
             if db.switch_session(uid,arg):
+                from quickstart_core import QuickDrafts
+                from pathlib import Path
+                QuickDrafts(Path(db.path).parent/'quickstarts').clear(uid)
                 await msg.answer(f'✅ Сейчас история «{active(uid)["title"]}».',
                                  reply_markup=kb([[('👤 Персонажи', 'ui:characters'), ('✒️ Первый пост', 'ui:begin')],
                                                   [('← К миру', f'w:world:{active(uid)["world_id"]}') if active(uid)['world_id'] else ('← К историям','ui:sessions')]]))

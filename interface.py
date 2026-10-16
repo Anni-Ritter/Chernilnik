@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, ReplyKeyboardMarkup, BufferedInputFile,
+    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, BufferedInputFile,
 )
 from vision import MAX_IMAGE_BYTES, describe_image, image_info
 
@@ -39,13 +39,9 @@ DRAFT_KEYS = ReplyKeyboardMarkup(keyboard=[
 ], resize_keyboard=True, input_field_placeholder='Часть длинного ролевого поста')
 
 
-MAIN_KEYS = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text='📚 Миры'), KeyboardButton(text='📖 Истории')],
-        [KeyboardButton(text='👤 Персонажи'), KeyboardButton(text='🗂 Меню')],
-        [KeyboardButton(text='✒️ Начать')],
-    ], resize_keyboard=True, input_field_placeholder='Ролевой пост или кнопка меню',
-)
+# The old five-row keyboard hid the input field. All advanced functions remain
+# available via Telegram's slash-command menu and /menu inline controls.
+MAIN_KEYS = ReplyKeyboardRemove()
 
 
 def keyboard(rows):
@@ -140,7 +136,7 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
 
     async def show_sessions(message: Message, user_id: int):
         active_id = active(user_id)['id']
-        rows = [[('➕ Новая история', 'w:storyworld')]]
+        rows = [[('✨ Новая история с идеи', 'qs:new')]]
         for s in db.list_sessions()[:25]:
             title = s['title'][:33]
             rows.append([(('✅ ' if s['id'] == active_id else '📖 ') + title, f'ui:session:{s["id"]}')])
@@ -375,6 +371,8 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             await message.answer('В каком мире будет история?', reply_markup=kb(rows))
         elif action == 'session' and arg.isdigit():
             if db.switch_session(uid, int(arg)):
+                from quickstart_core import QuickDrafts
+                QuickDrafts(Path(db.path).parent/'quickstarts').clear(uid)
                 await message.answer(f'✅ Активна история «{active(uid)["title"]}».',
                                      reply_markup=main_menu())
             else:
