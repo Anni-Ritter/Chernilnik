@@ -7,6 +7,10 @@ from __future__ import annotations
 
 import re
 
+SETUP_MAX_TOKENS = 2200
+SETUP_RETRY_MAX_TOKENS = 4800
+TELEGRAM_SAFE_CHUNK = 3800
+
 DIALOGUE_SYSTEM = '''Ты Чернильник — живой, внимательный ИИ-соавтор, с которым автор ОБСУЖДАЕТ будущую текстовую ролевую, прежде чем начать игру.
 Общайся по-русски естественно и содержательно, примерно как хороший собеседник: замечай конкретные идеи, их последствия и отношения героев, если полезно — предлагай интересные возможности. Не пересказывай каждое предложение автора и не изображай офисного секретаря.
 
@@ -32,9 +36,20 @@ STATUS_OR_DISCUSSION = re.compile(
 )
 
 
+CONTINUATION_MESSAGES = {
+    '\u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438',
+    '\u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0430\u0439',
+    '\u0434\u043e\u043f\u0438\u0448\u0438',
+    '\u0435\u0449\u0435',
+    '\u0435\u0449\u0451',
+}
+
+
 def is_discussion_only(text: str) -> bool:
     """Conservative: never accidentally drop new lore just because it's a question."""
     text = text.strip()
+    if text.casefold().strip(' .!?') in CONTINUATION_MESSAGES:
+        return True
     if '\n' in text or len(text) > 260:
         return False
     return bool(STATUS_OR_DISCUSSION.search(text))
@@ -124,22 +139,60 @@ def save_assistant_reply(drafts, uid: int, reply: str):
     drafts.save(uid, draft)
 
 
+def split_telegram_text(text: str, limit: int = TELEGRAM_SAFE_CHUNK) -> list[str]:
+    """Split at a sentence/newline/word boundary; never discard reply text."""
+    text = text.strip()
+    if not text:
+        return []
+    chunks = []
+    while len(text) > limit:
+        window = text[:limit + 1]
+        boundaries = [m.end() for m in re.finditer(r"(?<=[.!?\u2026])\s+|\n+", window)]
+        boundaries = [b for b in boundaries if b >= limit // 2]
+        if boundaries:
+            cut = boundaries[-1]
+        else:
+            cut = window.rfind(' ')
+            if cut < limit // 2:
+                cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+def _ran_out_of_tokens(response, *, polza: bool) -> bool:
+    if polza:
+        choices = getattr(response, 'choices', None) or []
+        reason = getattr(choices[0], 'finish_reason', None) if choices else None
+        return str(reason).lower() in ('length', 'max_tokens', 'max_output_tokens', 'max_tokens_exceeded')
+    status = str(getattr(response, 'status', '')).lower()
+    details = getattr(response, 'incomplete_details', None)
+    reason = str(getattr(details, 'reason', '')).lower()
+    return status == 'incomplete' or reason == 'max_output_tokens'
+
+
 async def generate_setup_reply(engine, db, draft: dict, latest: str, *, is_photo: bool = False) -> str:
-    """Small natural-language call. No JSON contract or new writes to story DB."""
+    """Natural setup chat: regenerate on token exhaustion, never show fragments."""
     choice = engine.generation_choice()
     client = engine.polza_client if choice.provider == 'polza' else engine.client
     if client is None:
-        raise RuntimeError('Выбранная модель недоступна: проверь ключ провайдера.')
+        raise RuntimeError('Selected model client is not configured.')
     messages = setup_dialogue_messages(db, draft, latest, is_photo=is_photo)
-    if choice.provider == 'polza':
-        response = await client.chat.completions.create(
-            model=choice.model, messages=messages, max_tokens=420)
-        reply = response.choices[0].message.content if response.choices else None
-    else:
-        response = await client.responses.create(
-            model=choice.model, instructions=messages[0]['content'],
-            input=messages[1]['content'], max_output_tokens=420, store=False)
-        reply = response.output_text
-    if not isinstance(reply, str) or not reply.strip():
-        raise RuntimeError('Модель не ответила на сообщение в подготовке.')
-    return reply.strip()[:3400]
+    for budget in (SETUP_MAX_TOKENS, SETUP_RETRY_MAX_TOKENS):
+        if choice.provider == 'polza':
+            response = await client.chat.completions.create(
+                model=choice.model, messages=messages, max_tokens=budget)
+            reply = response.choices[0].message.content if response.choices else None
+        else:
+            response = await client.responses.create(
+                model=choice.model, instructions=messages[0]['content'],
+                input=messages[1]['content'], max_output_tokens=budget, store=False)
+            reply = response.output_text
+        if _ran_out_of_tokens(response, polza=choice.provider == 'polza'):
+            continue
+        if not isinstance(reply, str) or not reply.strip():
+            raise RuntimeError('Selected model returned an empty setup response.')
+        return reply.strip()
+    raise RuntimeError('Selected model repeatedly hit the setup output-token limit.')

@@ -21,7 +21,7 @@ from quickstart_core import (QuickDrafts, EXTRACT_SYSTEM, setup_prompt,
                              decode_json, validate_plan, need_clarification,
                              find_world, wants_start, wants_new_story, install_plan)
 from typing_status import typing_during
-from setup_dialogue import (generate_setup_reply, save_assistant_reply, is_discussion_only)
+from setup_dialogue import (generate_setup_reply, save_assistant_reply, is_discussion_only, split_telegram_text)
 from vision import image_info, MAX_IMAGE_BYTES, describe_image
 
 log = logging.getLogger(__name__)
@@ -87,7 +87,8 @@ async def register_quickstart(db, engine, owner: int, begin_story):
                                  'нормально на него ответить. Можешь продолжать — ничего не потерялось.')
             return
         save_assistant_reply(drafts, uid, reply)
-        await message.answer(reply)
+        for part in split_telegram_text(reply):
+            await message.answer(part)
 
     async def select_world(message: Message, uid: int, wid: int):
         if wid > 0 and not db.get_world(wid):
