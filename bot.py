@@ -61,6 +61,8 @@ HELP = (
     '/menu — все дополнительные настройки\n'
     '/model — модель генерации\n'
     '/backup — копия SQLite\n'
+    '/memoryhealth — проверить автоматическую память\n'
+    '/syncmemory — восстановить память по прошлым ходам\n'
     '/cancelsetup — отменить подготовку\n'
     '/help — эта справка\n\n'
     'В уже начатой истории обычные сообщения считаются ролевыми ходами. '
@@ -136,9 +138,8 @@ async def cmd_menu(message: Message):
     if not await ensure_access(message):
         return
     from interface import main_menu
-    await message.answer('Клавиатура скрыта. Дополнительные настройки — ниже.',
-                         reply_markup=ReplyKeyboardRemove())
-    await message.answer('⚙️ Настройки Чернильника:', reply_markup=main_menu())
+    await message.answer('⚙️ Меню Чернильника · дополнительные возможности',
+                         reply_markup=main_menu())
 
 
 @router.message(Command('hidekeyboard'))
@@ -254,6 +255,89 @@ async def cmd_memory(message: Message):
              for row in rows[:22]]
     await send_long(message, '\n\n'.join(lines) + (f'\n\n…ещё {len(rows) - 22} записей' if len(rows) > 22 else ''))
 
+
+
+async def sync_memory(message: Message, uid: int, limit: int = 12):
+    """Recover past memory without touching immutable RP turns or generating new prose."""
+    if not AUTO_MEMORY:
+        await message.answer('Автоматическая память выключена. Установи AUTO_MEMORY=true на BotHost.')
+        return
+    if story_lock.locked():
+        await message.answer('Сейчас обрабатывается игровой пост. Повтори команду позже.')
+        return
+    async with story_lock:
+        sid = current(uid)['id']
+        rows = db.turns_for_memory_sync(sid, limit)
+        opening = db.get_opening(sid)
+        process_opening = opening is not None and db.memory_job(sid, None) is None
+        if not rows and not process_opening:
+            await message.answer('✅ Пропущенных или неудачных записей памяти не найдено.')
+            return
+        total = len(rows) + int(process_opening)
+        status = await message.answer(f'🧠 Восстанавливаю память: 0/{total} ходов. '
+                                      'Игровые сообщения не изменяются.')
+        ok = 0
+        failures = []
+        async with typing_during(message.bot, message.chat.id):
+            if process_opening:
+                try:
+                    await engine.memorize(sid, None, '', opening['bot_text'])
+                    ok += 1
+                except Exception:
+                    log.exception('Memory sync failed for story opening')
+                    failures.append('начальный пост')
+            for idx, row in enumerate(rows, start=1):
+                try:
+                    await engine.memorize(sid, row['id'], row['user_text'], row['bot_text'])
+                    ok += 1
+                except Exception:
+                    log.exception('Memory sync failed for turn %s', row['id'])
+                    failures.append('#'+str(row['id']))
+                if idx % 3 == 0:
+                    try:
+                        await status.edit_text(f'🧠 Восстанавливаю память: {idx + int(process_opening)}/{total}.')
+                    except Exception:
+                        pass
+        health = db.memory_health(sid)
+        tail = ('\nНе удалось обработать: '+', '.join(failures[:8])+'. Подробнее — в логах BotHost.'
+                if failures else '')
+        try:
+            await status.edit_text(f'🧠 Восстановление завершено: {ok}/{total}.\n'
+                                   f'Успешно проиндексировано: {health["done"]} из {health["total"]} ходов.\n'
+                                   f'Осталось без памяти: {health["unprocessed"]}; ошибок: {health["failed"]}.'
+                                   + tail)
+        except Exception:
+            await message.answer(f'🧠 Обработано {ok}/{total}.' + tail)
+
+
+@router.message(Command('memoryhealth'))
+async def cmd_memory_health(message: Message):
+    if not await ensure_access(message):
+        return
+    sid = current(message.from_user.id)['id']
+    health = db.memory_health(sid)
+    chars = db.list_characters(sid)
+    details = ', '.join(c['name'] for c in chars[:8]) or 'нет привязанных персонажей'
+    await message.answer('🧠 Состояние памяти текущей истории\n'
+                         f'Автоматическая память: {"включена" if AUTO_MEMORY else "ВЫКЛЮЧЕНА"}\n'
+                         f'Ходов всего: {health["total"]}\n'
+                         f'Обработано: {health["done"]}\n'
+                         f'Не обработано: {health["unprocessed"]}; ошибок: {health["failed"]}\n'
+                         f'Участники для анкет: {details}\n\n'
+                         'Чтобы дополнить память по прежним ходам — /syncmemory. '
+                         'Подробности ошибок — в логах BotHost.')
+
+
+@router.message(Command('syncmemory'))
+async def cmd_sync_memory(message: Message, command: CommandObject):
+    if not await ensure_access(message):
+        return
+    try:
+        count = max(1,min(25,int((command.args or '12').strip())))
+    except ValueError:
+        await message.answer('Использование: /syncmemory 12 (от 1 до 25 ходов)')
+        return
+    await sync_memory(message, message.from_user.id, count)
 
 @router.message(Command('model'))
 async def cmd_model(message: Message):
@@ -500,7 +584,7 @@ async def main():
         db, engine, OWNER, start_story)
     dp.include_router(await register_world_ui(db, OWNER, engine))
     dp.include_router(conversation_router)
-    dp.include_router(await register_interface(db, engine, OWNER, start_story, play))
+    dp.include_router(await register_interface(db, engine, OWNER, start_story, play, sync_memory))
     dp.include_router(router)
     # Telegram's slash-command menu replaces the permanently expanded keyboard.
     try:
@@ -512,6 +596,8 @@ async def main():
             BotCommand(command='draft', description='Длинный пост: собрать по частям'),
             BotCommand(command='play', description='Отправить собранный пост'),
             BotCommand(command='model', description='Модель художественного текста'),
+            BotCommand(command='memoryhealth', description='Проверить память истории'),
+            BotCommand(command='syncmemory', description='Восстановить память по ходам'),
             BotCommand(command='backup', description='Скачать копию базы'),
             BotCommand(command='cancelsetup', description='Отменить подготовку истории'),
             BotCommand(command='help', description='Справка'),

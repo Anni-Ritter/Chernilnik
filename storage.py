@@ -19,6 +19,56 @@ class Store(WorldMixin):
         self._backup_before_world_migration()
         self.init_worlds()
         self.enable_library_only_characters()
+        self.init_memory_tracking()
+
+    def init_memory_tracking(self):
+        """Track evidence extraction; no changes to existing narrative tables."""
+        with self.connect() as con:
+            con.execute("""CREATE TABLE IF NOT EXISTS memory_jobs (
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                turn_id INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL CHECK(status IN ('done','failed')),
+                total_saved INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, turn_id)
+            )""")
+
+    def memory_job(self, sid: int, turn_id: int | None):
+        with self.connect() as con:
+            return con.execute('SELECT * FROM memory_jobs WHERE session_id=? AND turn_id=?',
+                               (sid, turn_id or 0)).fetchone()
+
+    def record_memory_job(self, sid: int, turn_id: int | None, *, success: bool,
+                          count: int = 0, error: str = ''):
+        with self.connect() as con:
+            con.execute("""INSERT INTO memory_jobs(session_id,turn_id,status,total_saved,last_error)
+                VALUES (?,?,?,?,?) ON CONFLICT(session_id,turn_id) DO UPDATE SET
+                status=excluded.status,total_saved=excluded.total_saved,
+                last_error=excluded.last_error,
+                attempts=memory_jobs.attempts+1,updated_at=CURRENT_TIMESTAMP""",
+                (sid,turn_id or 0,'done' if success else 'failed',count,error[:180]))
+
+    def memory_health(self, sid: int):
+        with self.connect() as con:
+            totals = con.execute("""SELECT COUNT(*) AS total,
+                SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+                FROM memory_jobs WHERE session_id=? AND turn_id != 0""", (sid,)).fetchone()
+            turns = con.execute('SELECT COUNT(*) FROM turns WHERE session_id=?',(sid,)).fetchone()[0]
+            return {'total': turns, 'done': totals['done'] or 0,
+                    'failed': totals['failed'] or 0,
+                    'unprocessed': turns - (totals['done'] or 0) - (totals['failed'] or 0)}
+
+    def turns_for_memory_sync(self, sid: int, limit: int = 12):
+        """Recent failed/unprocessed turns, oldest first for chronological recall."""
+        with self.connect() as con:
+            rows = con.execute("""SELECT t.* FROM turns t
+                LEFT JOIN memory_jobs j ON j.session_id=t.session_id AND j.turn_id=t.id
+                WHERE t.session_id=? AND (j.status IS NULL OR j.status='failed')
+                ORDER BY t.id DESC LIMIT ?""",(sid,max(1,min(limit,25)))).fetchall()
+            return list(reversed(rows))
 
     def make_backup(self) -> Path:
         """Consistent hot snapshot; does not alter or move live SQLite."""

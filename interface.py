@@ -16,6 +16,7 @@ from aiogram.types import (
     ReplyKeyboardRemove, BufferedInputFile,
 )
 from vision import MAX_IMAGE_BYTES, describe_image, image_info
+from menu_navigation import InlineMenuMessage
 
 log = logging.getLogger(__name__)
 
@@ -54,16 +55,23 @@ def keyboard(rows):
 
 
 def main_menu():
+    """Small entry screen; all original tools remain one level deeper."""
     return keyboard([
-        [('🌍 Миры', 'w:home'), ('📖 Истории', 'ui:sessions')],
-        [('👤 Персонажи', 'ui:characters'), ('📋 Анкеты', 'w:profiles')],
-        [('🎭 Сцена и роли', 'ui:scene'), ('🧠 Память', 'ui:memory')],
-        [('🎨 Стиль и примеры', 'ui:style'), ('🤖 Модель текста', 'ui:model')],
-        [('✒️ Первый пост', 'ui:begin'), ('📝 Длинный пост', 'ui:draft')],
-        [('📦 Экспорт', 'ui:export'), ('📊 Статус', 'ui:status')],
-        [('🔎 Промпт к модели', 'ui:prompt'), ('💾 Копия базы', 'ui:backup')],
+        [('📖 Истории', 'ui:sessions'), ('🌍 Миры', 'w:home')],
+        [('👤 Герои', 'ui:characters'), ('🧠 Память', 'ui:memory')],
+        [('⚙️ Ещё настройки', 'ui:tools')],
     ])
 
+
+def tools_menu():
+    return keyboard([
+        [('🎭 Сцена и роли', 'ui:scene'), ('🤖 Модель текста', 'ui:model')],
+        [('🎨 Примеры стиля', 'ui:style'), ('📝 Длинный пост', 'ui:draft')],
+        [('✒️ Первый пост', 'ui:begin'), ('📊 Статус', 'ui:status')],
+        [('📦 Экспорт', 'ui:export'), ('💾 Резервная копия', 'ui:backup')],
+        [('🔎 Промпт', 'ui:prompt'), ('📋 Анкеты', 'w:profiles')],
+        [('← Меню', 'ui:home')],
+    ])
 
 def model_menu_text(engine):
     choice = engine.generation_choice()
@@ -113,7 +121,7 @@ def character_menu(cid: int):
     ])
 
 
-async def register_interface(db, engine, owner: int, begin_story, play_story):
+async def register_interface(db, engine, owner: int, begin_story, play_story, sync_memory=None):
     """Build router with injected engine and story operations; no circular imports."""
     router = Router(name='roleplay_ui')
     media_dir = Path(os.getenv('MEDIA_DIR') or str(Path(db.path).parent / 'portraits'))
@@ -304,15 +312,20 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
         await callback.answer()
         if not isinstance(callback.message, Message):
             return
-        message = callback.message
         uid = callback.from_user.id
         parts = (callback.data or '').split(':')
         action = parts[1] if len(parts) > 1 else ''
+        # Story text stays in the chat as its own message; only navigation edits.
+        message = (callback.message if action in ('begin','draftsend')
+                   else InlineMenuMessage(callback.message))
         arg = parts[2] if len(parts) > 2 else ''
         if action not in ('begin', 'draftsend'):
             await state.clear()
         if action == 'home':
             await show_menu(message, uid)
+        elif action == 'tools':
+            await message.answer('⚙️ Дополнительные возможности. Обычная игра не требует этих настроек.',
+                                 reply_markup=tools_menu())
         elif action == 'model':
             await message.answer(model_menu_text(engine), reply_markup=model_menu(engine))
         elif action == 'modelpick':
@@ -493,10 +506,17 @@ async def register_interface(db, engine, owner: int, begin_story, play_story):
             sid = active(uid)['id']
             facts = db.list_facts(sid, 15)
             fact_text = '\n'.join((('★ ' if f['pinned'] else '• ') + f['text'][:180]) for f in facts) or 'Пока пусто.'
-            await message.answer('🧠 Память истории:\n\n' + fact_text[:3200], reply_markup=keyboard([
+            health=db.memory_health(sid)
+            line=(f'\n\nИндексация: {health["done"]}/{health["total"]} ходов; '
+                  f'ошибок: {health["failed"]}; не обработано: {health["unprocessed"]}.')
+            await message.answer('🧠 Память истории:\n\n' + fact_text[:3000] + line, reply_markup=keyboard([
+                [('🔄 Восстановить пропущенные ходы', 'ui:memorysync')],
                 [('📌 Закрепить важный факт', 'ui:remember')],
                 [('← Меню', 'ui:home')],
             ]))
+        elif action == 'memorysync':
+            if sync_memory is not None:
+                await sync_memory(message, uid)
         elif action == 'remember':
             await state.set_state(Editing.pinned_fact)
             await state.update_data(session_id=active(uid)['id'])

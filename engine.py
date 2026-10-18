@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 from openai import AsyncOpenAI
 from storage import Store
@@ -144,7 +145,73 @@ class RoleplayEngine:
     async def generate(self, sid: int, post: str):
         return await self._call(sid, post=post, opening=False)
 
+    async def _extract_memory_payload(self, sid: int, prompt: str, source_text: str):
+        """Prefer inexpensive OpenAI memory; use fixed Gemini only if it fails.
+
+        Importantly, the prose model selector does not affect memory fallback:
+        a temporary RP model such as Euryale must never extract canon.
+        """
+        from memory_pipeline import parse_payload, important_turn
+        reason = None
+        try:
+            response = await self.client.responses.create(
+                model=self.memory_model, instructions=EXTRACT_INSTRUCTIONS, input=prompt,
+                max_output_tokens=int(os.getenv('MEMORY_OUTPUT_TOKENS', '3200')),
+                store=False, text={'format': {'type': 'json_object'}},
+            )
+            usage = getattr(response, 'usage', None)
+            self.db.add_usage(sid, 'memory', self.memory_model,
+                              getattr(usage, 'input_tokens', 0) or 0,
+                              getattr(usage, 'output_tokens', 0) or 0)
+            data = parse_payload(getattr(response, 'output_text', '') or '')
+            if (important_turn(source_text) and
+                    all(not data[k] for k in ('facts','world_changes','character_insights'))):
+                reason = 'OpenAI не извлёк фактов из значимого события'
+            else:
+                return data
+        except Exception as exc:
+            reason = f'{type(exc).__name__}: {exc}'
+            log.warning('Primary memory extraction failed in story %s: %s', sid, reason[:200])
+        # Polza is only a recovery channel, not a second paid pass for every post.
+        enabled = os.getenv('MEMORY_FALLBACK_POLZA', 'true').lower() in ('1','yes','true','on')
+        if not enabled or self.polza_client is None:
+            raise RuntimeError(f'Не удалось сохранить память (OpenAI): {reason}')
+        fallback_model = os.getenv('MEMORY_FALLBACK_MODEL', 'google/gemini-3.7-flash').strip()
+        try:
+            response = await self.polza_client.chat.completions.create(
+                model=fallback_model,
+                messages=[{'role':'system','content':EXTRACT_INSTRUCTIONS},
+                          {'role':'user','content':prompt}],
+                max_tokens=int(os.getenv('MEMORY_FALLBACK_TOKENS','3500')),
+            )
+            if not response.choices:
+                raise ValueError('Пустой ответ Polza')
+            content = response.choices[0].message.content or ''
+            if not isinstance(content, str):
+                raise ValueError('Неожиданный формат ответа Polza')
+            usage = getattr(response, 'usage', None)
+            self.db.add_usage(sid, 'memory_fallback', fallback_model,
+                              getattr(usage, 'prompt_tokens', 0) or 0,
+                              getattr(usage, 'completion_tokens', 0) or 0)
+            return parse_payload(content)
+        except Exception as exc:
+            raise RuntimeError(f'Извлечение памяти не удалось через OpenAI и Polza: {type(exc).__name__}') from exc
+
     async def memorize(self, sid: int, turn_id: int | None, post: str, answer: str):
+        """Audit memory results per turn, preserving the immutable original post."""
+        if not self.auto_memory:
+            return 0
+        self._last_memory_saved = 0
+        try:
+            total = await self._memorize_inner(sid, turn_id, post, answer)
+        except Exception as exc:
+            self.db.record_memory_job(sid, turn_id, success=False, error=type(exc).__name__ + ': ' + str(exc))
+            raise
+        self.db.record_memory_job(sid, turn_id, success=True,
+                                  count=getattr(self, "_last_memory_saved", total))
+        return total
+
+    async def _memorize_inner(self, sid: int, turn_id: int | None, post: str, answer: str):
         """Runs after the story is saved. Its failure must never erase the turn."""
         if not self.auto_memory:
             return 0
@@ -156,19 +223,30 @@ class RoleplayEngine:
         prompt = (extraction_prompt(post, answer, old_facts)
                   + '\n\nАКТИВНЫЕ ГЕРОИ (учитывай только этот список для анкеты):\n' + roster
                   + '\nМИР: ' + (world['name'] if world else 'не привязан'))
-        response = await self.client.responses.create(
-            model=self.memory_model, instructions=EXTRACT_INSTRUCTIONS, input=prompt,
-            max_output_tokens=2000, store=False,
-            text={'format': {'type': 'json_object'}},
-        )
-        usage = getattr(response, 'usage', None)
-        self.db.add_usage(sid, 'memory', self.memory_model,
-                          getattr(usage, 'input_tokens', 0) or 0,
-                          getattr(usage, 'output_tokens', 0) or 0)
-        data = json.loads(response.output_text or '{}')
+        data = await self._extract_memory_payload(sid, prompt, post + "\n" + answer)
         validated = validated_extractions(data, post + '\n' + answer)
         save_extractions(self.db, sid, turn_id, validated)
         source_text = post + '\n' + answer
+        saved_count = len(validated)
+        # Milestones are not psychological diagnoses. If a serious confirmed
+        # event explicitly NAMES a participant, show it in their story timeline
+        # even when the model omits the optional character_insights section.
+        # For an author-controlled hero, require evidence from THEIR post.
+        for fact in validated:
+            if fact['category'] not in ('event','relationship') or fact['certainty'] != 'confirmed':
+                continue
+            if fact['importance'] < 4:
+                continue
+            for character in cast:
+                if not re.search(r'(?<!\w)' + re.escape(character['name']) + r'(?!\w)',
+                                 fact['text'], flags=re.I):
+                    continue
+                if character['role'] == 'user' and fact['evidence'] not in post:
+                    continue
+                if self.db.add_development(character['id'], sid, turn_id,
+                                           'Сюжетное событие: ' + fact['text'],
+                                           fact['evidence'], 'confirmed'):
+                    saved_count += 1
         # World changes are exceptional: only evidence-backed, objective facts;
         # unverified rumours are not promoted into global canon.
         if world and isinstance(data.get('world_changes'), list):
@@ -179,7 +257,8 @@ class RoleplayEngine:
                 statement = str(item.get('text','')).strip()
                 if (evidence and evidence in source_text and 12 <= len(statement) <= 500
                         and item.get('certainty') == 'confirmed'):
-                    self.db.add_world_event(world['id'],statement,sid,turn_id,evidence,status='confirmed')
+                    if self.db.add_world_event(world['id'],statement,sid,turn_id,evidence,status='confirmed'):
+                        saved_count += 1
         if isinstance(data.get('character_insights'),list):
             names = {c['name'].casefold():c for c in cast}
             for item in data['character_insights'][:8]:
@@ -198,7 +277,8 @@ class RoleplayEngine:
                     # inner life/biography. The bot's post is not evidence.
                     if certainty != 'confirmed' or not post or evidence not in post:
                         continue
-                self.db.add_development(target['id'],sid,turn_id,text,evidence,certainty)
+                if self.db.add_development(target['id'],sid,turn_id,text,evidence,certainty):
+                    saved_count += 1
                 if field in PROFILE_FIELDS and certainty == 'confirmed':
                     # Story-local evolving sheet for BOTH players. Never overwrite
                     # any manually authored / imported field or story correction.
@@ -209,4 +289,5 @@ class RoleplayEngine:
                         self.db.set_profile_field(target['id'],field,text,sid=sid,
                                                   source='story' if target['role']=='user' else 'model',
                                                   certainty='confirmed',evidence=evidence)
+        self._last_memory_saved = saved_count
         return len(validated)

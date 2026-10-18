@@ -15,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from worlds import PROFILE_FIELDS, PROFILE_GROUPS
+from menu_navigation import InlineMenuMessage
 from lore_import import (analyze_bible, apply_bible, render_import_preview, MAX_SOURCE,
                          ImportDraft, draft_root, plan_from_draft, split_source)
 from typing_status import typing_during
@@ -113,7 +114,7 @@ async def register_world_ui(db, owner: int, engine=None):
                 [('📚 Энциклопедия: страны и места', f'w:lore:{wid}')],
                 [('📥 Выгрузить канон', f'w:exportcanon:{wid}')],
                 [('🗞 События мира', f'w:events:{wid}'), ('👥 Жители', f'w:library:{wid}')],
-                [('➕ Новая история здесь', f'qs:world:{wid}')]]
+                ]
         stories = db.world_stories(wid)
         if active(uid)['world_id'] is None:
             rows.append([('🔗 Привязать текущую историю к миру', f'w:bind:{wid}')])
@@ -361,7 +362,7 @@ async def register_world_ui(db, owner: int, engine=None):
         await callback.answer()
         if not isinstance(callback.message, Message):
             return
-        msg,uid = callback.message,callback.from_user.id
+        msg,uid = InlineMenuMessage(callback.message),callback.from_user.id
         p = (callback.data or '').split(':')
         action = p[1] if len(p)>1 else ''
         arg = int(p[2]) if len(p)>2 and p[2].isdigit() else 0
