@@ -15,6 +15,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from worlds import PROFILE_FIELDS, PROFILE_GROUPS
+from profile_view import (selected_profile_fields, group_for_field, field_marker,
+                          group_text, detail_text, edit_text)
 from menu_navigation import InlineMenuMessage
 from lore_import import (analyze_bible, apply_bible, render_import_preview, MAX_SOURCE,
                          ImportDraft, draft_root, plan_from_draft, split_source)
@@ -255,9 +257,7 @@ async def register_world_ui(db, owner: int, engine=None):
         s = active(uid)
         attached = db.story_has_character(s['id'],cid)
         rows = db.profile_fields(cid, s['id'] if attached else None)
-        fields = {}
-        for r in rows:
-            fields[r['field']] = r
+        fields = selected_profile_fields(rows)
         bits = [f'👤 {ch["name"]}',
                 '🎭 ' + ('Твоя история · участник' if attached else 'Библиотека мира · не участвует'),
                 f'Описание: {ch["description"][:400] or "не задано"}', '', '📋 АНКЕТА']
@@ -288,7 +288,7 @@ async def register_world_ui(db, owner: int, engine=None):
         if not ch:
             return await msg.answer('Персонаж не найден.')
         sheet_rows = db.profile_fields(cid, active(uid)['id'] if db.story_has_character(active(uid)['id'],cid) else None)
-        present = {r['field']:r for r in sheet_rows}
+        present = selected_profile_fields(sheet_rows)
         if group is None:
             rows=[]
             for code,(label,keys) in PROFILE_GROUPS.items():
@@ -296,8 +296,8 @@ async def register_world_ui(db, owner: int, engine=None):
                 rows.append([(f'{label} · {count}/{len(keys)}',f'w:group:{cid}:{code}')])
             rows.append([('← К анкете', f'w:sheet:{cid}')])
             await msg.answer(f'📋 {ch["name"]} · анкета\n\n'
-                             'Выбери раздел. Все поля необязательны. '
-                             'Подтверждённые сведения автора имеют приоритет над выводами модели.',
+                             'Открой раздел, чтобы посмотреть сохранённые значения. '
+                             'Ничего не нужно заполнять для просмотра.',
                              reply_markup=kb(rows))
             return
         if group not in PROFILE_GROUPS:
@@ -306,12 +306,21 @@ async def register_world_ui(db, owner: int, engine=None):
         rows=[]
         for key in keys:
             record=present.get(key)
-            mark=('✅ ' if record and record['source']=='author' else '✦ ' if record else '○ ')
-            rows.append([(mark+PROFILE_FIELDS[key],f'w:set:{cid}:{key}')])
+            rows.append([(field_marker(record)+' '+PROFILE_FIELDS[key],f'w:field:{cid}:{key}')])
         rows.append([('← Разделы анкеты',f'w:fields:{cid}')])
-        await msg.answer(f'{title} · {ch["name"]}\n\n'
-                         '✅ — заполнено тобой; ✦ — наблюдение бота; ○ — пусто.\n'
-                         'Нажми на поле, чтобы заполнить или изменить его.',reply_markup=kb(rows))
+        await msg.answer(group_text(ch['name'],group,present),reply_markup=kb(rows))
+
+    async def field_detail(msg,cid,uid,key):
+        ch=can_see_char(cid,uid)
+        if not ch or key not in PROFILE_FIELDS:
+            return await msg.answer('Поле анкеты не найдено.')
+        sid=active(uid)['id'] if db.story_has_character(active(uid)['id'],cid) else None
+        records=selected_profile_fields(db.profile_fields(cid,sid))
+        group=group_for_field(key)
+        await msg.answer(detail_text(ch['name'],key,records.get(key)),reply_markup=kb([
+            [('✏️ Изменить',f'w:edit:{cid}:{key}')],
+            [('← К разделу',f'w:group:{cid}:{group}')],
+        ]))
 
     async def events(msg,wid):
         w = db.get_world(wid)
@@ -525,14 +534,19 @@ async def register_world_ui(db, owner: int, engine=None):
             await fields(msg,arg,uid)
         elif action == 'group' and len(p)>3:
             await fields(msg,arg,uid,p[3])
-        elif action == 'set' and len(p)>3 and p[3] in PROFILE_FIELDS:
+        elif action == 'field' and len(p)>3 and p[3] in PROFILE_FIELDS:
+            await field_detail(msg,arg,uid,p[3])
+        elif action in ('set','edit') and len(p)>3 and p[3] in PROFILE_FIELDS:
             if not can_see_char(arg,uid):
                 return await msg.answer('Персонаж не найден.')
+            key=p[3]
+            sid=active(uid)['id'] if db.story_has_character(active(uid)['id'],arg) else None
+            records=selected_profile_fields(db.profile_fields(arg,sid))
             await state.set_state(Form.profile_field)
-            await state.update_data(cid=arg,field=p[3],sid=active(uid)['id'])
-            await msg.answer(f'✏️ {db.get_character(arg)["name"]} · {PROFILE_FIELDS[p[3]]}\n'
-                             'Напиши значение (до 1500 символов) или отправь «-» чтобы очистить поле.\n'
-                             'Ручные поля анкеты считаются авторскими фактами.')
+            await state.update_data(cid=arg,field=key,sid=active(uid)['id'])
+            await msg.answer(edit_text(db.get_character(arg)['name'],key,records.get(key)),
+                             reply_markup=kb([[('❌ Отменить редактирование',
+                                               f'w:group:{arg}:{group_for_field(key)}')]]))
         elif action == 'history':
             await history(msg,arg,uid)
         elif action == 'histories' and can_see_char(arg,uid):
@@ -716,15 +730,33 @@ async def register_world_ui(db, owner: int, engine=None):
             return
         data=await state.get_data()
         cid=data.get('cid')
-        if not cid or not can_see_char(cid,message.from_user.id):
+        key=data.get('field')
+        if not cid or not can_see_char(cid,message.from_user.id) or key not in PROFILE_FIELDS:
             await state.clear()
             return await message.answer('Не удалось открыть карточку.')
         value=(message.text or '').strip()
+        if value.casefold() in ('отмена', '/cancel'):
+            await state.clear()
+            return await fields(message,cid,message.from_user.id,group_for_field(key))
+        if value.startswith('/'):
+            return await message.answer('Команда не записана в анкету. Чтобы выйти, нажми «Отменить редактирование» или отправь /cancel.',
+                                        reply_markup=kb([[('❌ Отменить редактирование',
+                                                          f'w:group:{cid}:{group_for_field(key)}')]]))
         if len(value)>1500:
-            return await message.answer('Максимум 1500 символов.')
+            return await message.answer('Максимум 1500 символов. Поле не изменено.',
+                                        reply_markup=kb([[('❌ Отменить редактирование',
+                                                          f'w:group:{cid}:{group_for_field(key)}')]]))
+        if not value:
+            return await message.answer('Пришли значение или нажми «Отменить редактирование».',
+                                        reply_markup=kb([[('❌ Отменить редактирование',
+                                                          f'w:group:{cid}:{group_for_field(key)}')]]))
         # Author-defined character identity/psychology is shared across stories.
-        db.set_profile_field(cid,data['field'],'' if value=='-' else value,sid=0)
+        db.set_profile_field(cid,key,'' if value=='-' else value,sid=0)
+        if value=='-' and db.story_has_character(active(message.from_user.id)['id'],cid):
+            # Clearing must also hide old story-local extracted values; otherwise
+            # they resurface in the UI immediately after the author clears a field.
+            db.set_profile_field(cid,key,'',sid=active(message.from_user.id)['id'])
         await state.clear()
-        await sheet(message,cid,message.from_user.id)
+        await fields(message,cid,message.from_user.id,group_for_field(key))
 
     return router
