@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -65,6 +66,7 @@ HELP = (
     '/syncmemory — восстановить память по прошлым ходам\n'
     '/scene — увидеть текущее состояние сцены\n'
     '/syncscene — восстановить состояние из последних ходов (1 вызов модели)\n'
+    '/rewind — откатить последние ходы с резервной копией\n'
     '/setcharstate — вручную уточнить текущее состояние героя\n'
     '/cancelsetup — отменить подготовку\n'
     '/help — эта справка\n\n'
@@ -246,6 +248,124 @@ async def cmd_scene(message: Message):
         await send_long(message, snapshot + '\n\nЕсли нужна авторская поправка — '
                         '/setscene location | На корабле в море. '
                         'Ручная поправка закрепляется, пока её не снимешь командой /clearscene.')
+
+
+# A literary *turn* is one authored post plus one generated response.
+# Rewind never deletes Telegram messages, only the database timeline.
+@router.message(Command('rewind'))
+async def cmd_rewind(message: Message, command: CommandObject):
+    if not await ensure_access(message):
+        return
+    sid = current(message.from_user.id)['id']
+    query = (command.args or '').strip()
+    # A numeric argument opens a specific saved turn. Text searches old turns.
+    if query.isdecimal():
+        target_id = int(query)
+        with db.connect() as con:
+            target = con.execute('SELECT id,user_text,bot_text FROM turns WHERE session_id=? AND id=?',
+                                 (sid,target_id)).fetchone()
+        rows = [target] if target else []
+    else:
+        rows = db.rewind_candidates(sid, query, limit=12)
+    if not rows:
+        await message.answer('Не нашла таких ходов. Попробуй /rewind или /rewind поцелуй.')
+        return
+    latest = db.rewind_candidates(sid, limit=1)
+    tail = latest[0]['id']
+    buttons = []
+    for row in rows:
+        excerpt = ' '.join(row['user_text'].split())
+        if not excerpt:
+            excerpt = ' '.join(row['bot_text'].split())
+        if len(excerpt) > 43:
+            excerpt = excerpt[:40].rstrip() + '…'
+        buttons.append([InlineKeyboardButton(text=f"Ход #{row['id']} · {excerpt}",
+                          callback_data=f"rw:pick:{sid}:{row['id']}:{tail}")])
+    buttons.append([InlineKeyboardButton(text='✖ Отмена',callback_data='rw:cancel')])
+    await message.answer('⏪ Выбери ход, к которому хочешь вернуться.\n'
+                         'Поиск: /rewind поцелуй. Ничего пока не удалено.',
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith('rw:'))
+async def callback_rewind(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != OWNER:
+        await callback.answer('Недоступно.', show_alert=True)
+        return
+    data = (callback.data or '').split(':')
+    if len(data) == 2 and data[1] == 'cancel':
+        await callback.answer('Отменено.')
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text('Откат отменён. История не менялась.')
+        return
+    try:
+        stage, sid, target, tail = data[1], int(data[2]), int(data[3]), int(data[4])
+        keep_flag = data[5] if len(data) > 5 else ''
+        if len(data) not in (5,6) or stage not in ('pick','ask','go'):
+            raise ValueError('Неизвестная операция')
+        if stage != 'pick' and keep_flag not in ('keep','drop'):
+            raise ValueError('Неизвестная точка отката')
+        if sid != current(callback.from_user.id)['id']:
+            raise ValueError('Ты переключилась на другую историю. Запусти /rewind заново.')
+        if stage == 'pick':
+            # The preview is protected against intervening story turns.
+            db.rewind_preview(sid,target,False,tail)
+            with db.connect() as con:
+                row = con.execute('SELECT user_text FROM turns WHERE session_id=? AND id=?',
+                                  (sid,target)).fetchone()
+            excerpt = ' '.join(row['user_text'].split())[:600]
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='До хода (убрать его)',
+                    callback_data=f'rw:ask:{sid}:{target}:{tail}:drop')],
+                [InlineKeyboardButton(text='После хода (оставить его)',
+                    callback_data=f'rw:ask:{sid}:{target}:{tail}:keep')],
+                [InlineKeyboardButton(text='✖ Отмена',callback_data='rw:cancel')],
+            ])
+            text = (f'⏪ Ход #{target} (твой пост + ответ Чернильника):\n\n{excerpt}\n\n'
+                    '«До» удалит этот ход и все следующие.\n'
+                    '«После» оставит оба поста этого хода, но удалит все следующие.')
+            await callback.answer()
+            if isinstance(callback.message, Message):
+                await callback.message.edit_text(text,reply_markup=markup)
+            return
+        keep = keep_flag == 'keep'
+        preview = db.rewind_preview(sid,target,keep,tail)
+        if stage == 'ask':
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"Подтвердить: убрать {preview['removed']} ход(ов)",
+                    callback_data=f'rw:go:{sid}:{target}:{tail}:{keep_flag}')],
+                [InlineKeyboardButton(text='✖ Нет, оставить как есть',callback_data='rw:cancel')],
+            ])
+            await callback.answer()
+            if isinstance(callback.message, Message):
+                await callback.message.edit_text(
+                    f"Последнее предупреждение. Будут исключены из сюжета {preview['removed']} ход(ов).\n"
+                    'Перед изменением Чернильник создаст полную копию SQLite.\n'
+                    'Сообщения в Telegram останутся, но в памяти истории их больше не будет.\n'
+                    'После отката стоит проверить /scene и анкеты.',reply_markup=markup)
+            return
+        # Only a deliberate button tap can perform the operation.
+        await callback.answer('Откатываю историю и сохраняю резервную копию…')
+        async with story_lock:
+            result = db.rewind_to(sid,target,keep,tail)
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text(
+                f'✅ Откат выполнен. Исключено ходов: {result.removed}.\n'
+                'Прежняя ветка сохранена в резервной копии.\n'
+                'Проверь /scene; если состояние неполное, используй /syncscene 12.\n'
+                'Теперь можешь написать следующий пост по новому развитию событий.')
+            try:
+                await callback.message.answer_document(
+                    FSInputFile(str(result.backup_path)),
+                    caption='SQLite до отката — сохрани файл, если захочешь восстановить прежнюю ветку.')
+            except Exception:
+                log.exception('Rewind succeeded but sending SQLite backup to Telegram failed')
+                await callback.message.answer('Не получилось отправить архив базы. Он сохранён на сервере: '
+                                              + str(result.backup_path))
+    except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+        await callback.answer('Откат не выполнен.', show_alert=True)
+        if isinstance(callback.message, Message):
+            await callback.message.answer(f'Откат отменён: {exc}\nПопробуй /rewind заново.')
 
 
 @router.message(Command('setscene'))
@@ -708,6 +828,7 @@ async def main():
             BotCommand(command='syncmemory', description='Восстановить память по ходам'),
             BotCommand(command='scene', description='Где герои и что с ними сейчас'),
             BotCommand(command='syncscene', description='Сверить текущую сцену по истории'),
+            BotCommand(command='rewind', description='Откатиться к выбранному ходу'),
             BotCommand(command='backup', description='Скачать копию базы'),
             BotCommand(command='cancelsetup', description='Отменить подготовку истории'),
             BotCommand(command='help', description='Справка'),

@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from worlds import WorldMixin
 from continuity import ContinuityMixin
+from rewind import RewindMixin
 
 log = logging.getLogger(__name__)
 
 
-class Store(ContinuityMixin, WorldMixin):
+class Store(RewindMixin, ContinuityMixin, WorldMixin):
     def __init__(self, path: str):
         self.path = str(Path(path))
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
