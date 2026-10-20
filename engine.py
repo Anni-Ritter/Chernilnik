@@ -9,7 +9,7 @@ import re
 from openai import AsyncOpenAI
 from storage import Store
 from prompting import PromptComposer
-from memory import EXTRACT_INSTRUCTIONS, extraction_prompt, select_memories, validated_extractions, save_extractions
+from memory import EXTRACT_INSTRUCTIONS, extraction_prompt, select_memories, validated_extractions, save_extractions, keep_world_claims_at_source_level
 from generation_models import GenerationChoice, GenerationSettings
 from worlds import PROFILE_FIELDS
 from generation_continuation import (
@@ -257,6 +257,7 @@ class RoleplayEngine:
                   + '\nМИР: ' + (world['name'] if world else 'не привязан'))
         data = await self._extract_memory_payload(sid, prompt, post + "\n" + answer)
         validated = validated_extractions(data, post + '\n' + answer)
+        validated = keep_world_claims_at_source_level(validated, post, answer)
         save_extractions(self.db, sid, turn_id, validated)
         source_text = post + '\n' + answer
         saved_count = len(validated)

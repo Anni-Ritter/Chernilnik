@@ -237,12 +237,19 @@ class WorldMixin:
                              max_items: int = 7):
         from memory import tokens
         keys = tokens(query)
+        def related_terms(article_terms: set[str]) -> int:
+            # Very small inflection-tolerant match for proper nouns.  E.g.
+            # Псеумы/Псеуме, Эльдора/Эльдоре, Севтос/Севтоса.
+            # Exact matches remain preferable and short words aren't fuzzed.
+            return sum(1 for term in article_terms if any(
+                term == word or (len(term) >= 5 and len(word) >= 5
+                                 and term[:5] == word[:5]) for word in keys))
         scored = []
         for article in self.list_world_lore(wid):
             title = article['title']
             # Title matches are much more reliable than full-text accidental overlaps.
             title_terms = tokens(title)
-            title_score = 25 * len(title_terms & keys)
+            title_score = 25 * related_terms(title_terms)
             mention = 90 if title.casefold() in query.casefold() else 0
             body_score = min(10, len(tokens(article['body'][:2500]) & keys))
             pinned_score = 75 if article['pinned'] else 0

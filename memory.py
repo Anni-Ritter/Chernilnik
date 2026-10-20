@@ -78,6 +78,38 @@ def validated_extractions(payload: Any, source_text: str) -> list[dict[str, Any]
     return found
 
 
+def keep_world_claims_at_source_level(facts: list[dict[str, Any]], author_post: str,
+                                      bot_post: str) -> list[dict[str, Any]]:
+    """Do not canonize an NPC's assertion or the model's newly invented laws.
+
+    This deliberately checks provenance, not truth. Author dialogue remains a
+    belief, whereas author narration may establish a world fact. The model's
+    own world-building may be useful but requires confirmation before canon.
+    Existing world articles and manual facts are not modified by this filter.
+    """
+    def is_spoken_in(text: str, evidence: str) -> bool:
+        for line in text.splitlines():
+            if evidence in line and line.lstrip().startswith(('-', '—', '«')):
+                return True
+        return False
+
+    guarded = []
+    for item in facts:
+        fact = dict(item)
+        if fact.get('category') == 'world' and fact.get('certainty') == 'confirmed':
+            evidence = fact.get('evidence', '')
+            from_author = bool(evidence and evidence in author_post)
+            if not from_author and evidence in bot_post:
+                # The narrator may describe a *new* world detail, but the
+                # engine must not canonize it merely for the NPC's argument.
+                fact['certainty'] = 'uncertain'
+            elif from_author and is_spoken_in(author_post, evidence):
+                # An in-character assertion is a belief, not authoritative lore.
+                fact['certainty'] = 'belief'
+        guarded.append(fact)
+    return guarded
+
+
 EXTRACT_INSTRUCTIONS = '''Ты индексатор памяти для литературной ролевой. Выделяй только факты, подтверждённые текстом ТЕКУЩЕГО хода. Ответ: строго JSON-объект {"facts": [], "world_changes": [], "character_insights": []}. Каждому элементу нужны ключи:
 text (одно атомарное утверждение по-русски: кто, что сделал, с кем, где, почему — если известно),
 category (event/relationship/identity/goal/world/secret/time/object),
@@ -88,7 +120,7 @@ importance (3, 4 или 5), certainty (confirmed/belief/uncertain), known_by (к
 3 — временная, но сюжетно полезная деталь (например, значимая для текущей сцены улика).
 1–2: НЕ СОХРАНЯЙ — незначимый цвет камня, погода, декоративные предметы, жесты, случайные реплики.
 
-Не превращай обвинения, подозрения, ложь, мысли героя в объективную истину: присваивай belief/uncertain. Не додумывай. Не переписывай старые сведения без доказательств. Прошедшие события формулируй как ПРОШЕДШИЕ: "похитил", а не бессрочно "держит в плену", если текущий статус неизвестен. Новое событие (побег/освобождение) не отменяет историю того, кто изначально похитил персонажа. Не фиксируй «зима прошла», если прошли только посты: количество сообщений не равно прошедшему времени. Максимум 6 фактов за ход. Также заполняй массив world_changes (обычно пустой) только для объективно свершившихся ГЛОБАЛЬНЫХ перемен мира: смена власти, война, катастрофа, новый/изменённый закон. Элемент {"text":"...", "certainty":"confirmed", "evidence":"дословный фрагмент"}. НЕ записывай план, слух, мнение, гипотезу, частный эпизод или переход времени без свидетельств. Максимум 2.
+Не превращай обвинения, подозрения, ложь, мысли героя в объективную истину: присваивай belief/uncertain. Особенно строго разделяй утверждения о правилах чужих стран, гильдий, законах, рангах, таможнях и разрешениях: если персонаж просто уверенно назвал правило, это ЕГО МНЕНИЕ, а не подтверждённый закон мира. Реплики героев ОБЕИХ сторон могут быть неверными. Прямая авторская констатация в повествовании, наблюдаемое событие или утверждённая энциклопедия имеют другой статус. Не записывай как confirmed придуманные моделью процедуры, которые лишь оправдывают поведение NPC. Не додумывай. Не переписывай старые сведения без доказательств. Прошедшие события формулируй как ПРОШЕДШИЕ: "похитил", а не бессрочно "держит в плену", если текущий статус неизвестен. Новое событие (побег/освобождение) не отменяет историю того, кто изначально похитил персонажа. Не фиксируй «зима прошла», если прошли только посты: количество сообщений не равно прошедшему времени. Максимум 6 фактов за ход. Также заполняй массив world_changes (обычно пустой) только для объективно свершившихся ГЛОБАЛЬНЫХ перемен мира: смена власти, война, катастрофа, новый/изменённый закон. Элемент {"text":"...", "certainty":"confirmed", "evidence":"дословный фрагмент"}. НЕ записывай план, слух, мнение, гипотезу, частный эпизод или переход времени без свидетельств. Максимум 2.
 
 Дополнительно массив character_insights, до 8 за ход: {"name":"ТОЧНОЕ имя одного из активных персонажей", "field":"одно из age/gender/species/origin/residence/occupation/family/values/goals/fears/defenses/attachments/boundaries/conflicts/habits/self_image или пустая строка", "text":"конкретное устойчивое сведение о персонаже", "certainty":"confirmed/interpretation", "evidence":"дословная цитата из текущих постов"}. Заполняй анкеты ОБОИХ АВТОРОВ: не пропускай героя игрока! Если пользователь явно описал возраст, прошлое, убеждения, предпочтения, привязанности, характер, страхи, мысли или устойчивые привычки своего персонажа, вынеси это как confirmed с точной цитатой ТОЛЬКО из ПОСТА ПОЛЬЗОВАТЕЛЯ. У героя игрока запрещены интерпретации: не выводи страх, любовь, травму, мотив из позы, движения или намёков; НЕ бери его биографию и психику из речи/мыслей героя бота. У героев бота обоснованные интерпретации допустимы с отметкой interpretation, но не как подтверждённый факт. Значимые временные изменения можно сохранять как развитие. Не дублируй уже известное. Не записывай одежду с одного эпизода как постоянную внешность. Если ничего нового — массив пуст.'''
 
