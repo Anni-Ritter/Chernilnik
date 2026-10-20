@@ -6,11 +6,12 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from worlds import WorldMixin
+from continuity import ContinuityMixin
 
 log = logging.getLogger(__name__)
 
 
-class Store(WorldMixin):
+class Store(ContinuityMixin, WorldMixin):
     def __init__(self, path: str):
         self.path = str(Path(path))
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -20,6 +21,22 @@ class Store(WorldMixin):
         self.init_worlds()
         self.enable_library_only_characters()
         self.init_memory_tracking()
+        self._backup_before_continuity_migration()
+        self.init_continuity()
+
+    def _backup_before_continuity_migration(self):
+        """Snapshot once before the first v0.8 state migration, not each reboot."""
+        with self.connect() as con:
+            has_state = con.execute("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scene_state')").fetchone()[0]
+            has_content = (con.execute('SELECT EXISTS(SELECT 1 FROM turns)').fetchone()[0]
+                           or con.execute('SELECT EXISTS(SELECT 1 FROM openings)').fetchone()[0]
+                           or con.execute('SELECT EXISTS(SELECT 1 FROM characters)').fetchone()[0])
+            if has_state or not has_content:
+                return
+            if con.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                raise RuntimeError('SQLite не прошла проверку целостности: миграция отменена')
+        path = self.make_backup()
+        log.warning('Created pre-v0.8 continuity snapshot: %s', path)
 
     def init_memory_tracking(self):
         """Track evidence extraction; no changes to existing narrative tables."""

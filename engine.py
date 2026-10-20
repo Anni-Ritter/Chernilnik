@@ -12,6 +12,7 @@ from prompting import PromptComposer
 from memory import EXTRACT_INSTRUCTIONS, extraction_prompt, select_memories, validated_extractions, save_extractions, keep_world_claims_at_source_level
 from generation_models import GenerationChoice, GenerationSettings
 from worlds import PROFILE_FIELDS
+from continuity import SCENE_EXTRACTION_RULES, validated_scene_updates
 from generation_continuation import (
     CONTINUATION_PROMPT, automatic_continuations, followup_token_budget,
     reached_limit, message_text, append_continuation,
@@ -187,7 +188,7 @@ class RoleplayEngine:
         reason = None
         try:
             response = await self.client.responses.create(
-                model=self.memory_model, instructions=EXTRACT_INSTRUCTIONS, input=prompt,
+                model=self.memory_model, instructions=EXTRACT_INSTRUCTIONS + SCENE_EXTRACTION_RULES, input=prompt,
                 max_output_tokens=int(os.getenv('MEMORY_OUTPUT_TOKENS', '3200')),
                 store=False, text={'format': {'type': 'json_object'}},
             )
@@ -197,7 +198,7 @@ class RoleplayEngine:
                               getattr(usage, 'output_tokens', 0) or 0)
             data = parse_payload(getattr(response, 'output_text', '') or '')
             if (important_turn(source_text) and
-                    all(not data[k] for k in ('facts','world_changes','character_insights'))):
+                    all(not data[k] for k in ('facts','world_changes','character_insights','scene_updates'))):
                 reason = 'OpenAI не извлёк фактов из значимого события'
             else:
                 return data
@@ -212,7 +213,7 @@ class RoleplayEngine:
         try:
             response = await self.polza_client.chat.completions.create(
                 model=fallback_model,
-                messages=[{'role':'system','content':EXTRACT_INSTRUCTIONS},
+                messages=[{'role':'system','content':EXTRACT_INSTRUCTIONS + SCENE_EXTRACTION_RULES},
                           {'role':'user','content':prompt}],
                 max_tokens=int(os.getenv('MEMORY_FALLBACK_TOKENS','3500')),
             )
@@ -237,6 +238,7 @@ class RoleplayEngine:
         try:
             total = await self._memorize_inner(sid, turn_id, post, answer)
         except Exception as exc:
+            self.db.record_scene_job(sid, turn_id, success=False, details=str(exc))
             self.db.record_memory_job(sid, turn_id, success=False, error=type(exc).__name__ + ': ' + str(exc))
             raise
         self.db.record_memory_job(sid, turn_id, success=True,
@@ -256,11 +258,16 @@ class RoleplayEngine:
                   + '\n\nАКТИВНЫЕ ГЕРОИ (учитывай только этот список для анкеты):\n' + roster
                   + '\nМИР: ' + (world['name'] if world else 'не привязан'))
         data = await self._extract_memory_payload(sid, prompt, post + "\n" + answer)
+        # Current state and historical events serve different purposes.
+        scene_updates = validated_scene_updates(data, post, answer, cast)
+        state_saved = self.db.update_scene(sid, turn_id or 0, scene_updates)
+        self.db.record_scene_job(sid, turn_id, success=True,
+                                 details=f'{state_saved} updated fields')
         validated = validated_extractions(data, post + '\n' + answer)
         validated = keep_world_claims_at_source_level(validated, post, answer)
         save_extractions(self.db, sid, turn_id, validated)
         source_text = post + '\n' + answer
-        saved_count = len(validated)
+        saved_count = len(validated) + state_saved
         # Milestones are not psychological diagnoses. If a serious confirmed
         # event explicitly NAMES a participant, show it in their story timeline
         # even when the model omits the optional character_insights section.
@@ -324,3 +331,37 @@ class RoleplayEngine:
                                                   certainty='confirmed',evidence=evidence)
         self._last_memory_saved = saved_count
         return len(validated)
+
+    async def rebuild_scene_snapshot(self, sid: int, max_turns: int = 12) -> int:
+        """One cheap memory call for a retrospective snapshot, no replay of prose.
+
+        A valid response is required before writing ANY new state. This does not
+        rewrite events, card contents, story turns or the world encyclopedia.
+        """
+        max_turns = max(1, min(int(max_turns), 20))
+        turns = self.db.recent_turns(sid, max_turns)
+        if not turns:
+            return 0
+        # Newest last: the final state must win, not a historical observation.
+        user_text = '\n\n'.join('[ХОД ' + str(t['id']) + ', АВТОР]\n' + t['user_text'][-2300:]
+                                for t in turns)
+        bot_text = '\n\n'.join('[ХОД ' + str(t['id']) + ', СОАВТОР]\n' + t['bot_text'][-2800:]
+                               for t in turns)
+        # Source groups remain separate for grounded author/bot role control.
+        combined = ('ЗАДАЧА: восстановить ТОЛЬКО ТЕКУЩИЙ СНИМОК на конец последнего хода. '
+                    'Не выдавать промежуточные состояния и предположения за текущее. '
+                    'Пиши кратко, не придумывай прошлое.\n'
+                    'ОТВЕТ: {"facts":[],"world_changes":[],"character_insights":[],"scene_updates":[...]}.\n'
+                    'ГЕРОИ: ' + ', '.join(c['name'] + ' (' + c['role'] + ')'
+                                          for c in self.db.list_characters(sid)) + '\n\n'
+                    'ИСТОРИЯ В ХРОНОЛОГИИ (для понимания порядка):\n' +
+                    '\n\n'.join('[ХОД '+str(t['id'])+']\nАВТОР: '+t['user_text'][-1300:]
+                                 +'\nСОАВТОР: '+t['bot_text'][-1500:] for t in turns))
+        last_id = turns[-1]['id']
+        data = await self._extract_memory_payload(sid, combined, user_text + '\n' + bot_text)
+        if not isinstance(data.get('scene_updates'), list):
+            raise ValueError('Память не вернула scene_updates')
+        updates = validated_scene_updates(data, user_text, bot_text, self.db.list_characters(sid))
+        count = self.db.update_scene(sid, last_id, updates)
+        self.db.record_scene_job(sid, last_id, success=True, details=f'rebuild: {count} updated')
+        return count

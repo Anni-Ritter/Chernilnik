@@ -63,6 +63,9 @@ HELP = (
     '/backup — копия SQLite\n'
     '/memoryhealth — проверить автоматическую память\n'
     '/syncmemory — восстановить память по прошлым ходам\n'
+    '/scene — увидеть текущее состояние сцены\n'
+    '/syncscene — восстановить состояние из последних ходов (1 вызов модели)\n'
+    '/setcharstate — вручную уточнить текущее состояние героя\n'
     '/cancelsetup — отменить подготовку\n'
     '/help — эта справка\n\n'
     'В уже начатой истории обычные сообщения считаются ролевыми ходами. '
@@ -228,6 +231,111 @@ async def cmd_time(message: Message, command: CommandObject):
 @router.message(Command('location'))
 async def cmd_location(message: Message, command: CommandObject):
     await set_field(message, command, 'current_location', '/location покинутая башня')
+
+
+@router.message(Command('scene'))
+async def cmd_scene(message: Message):
+    if not await ensure_access(message):
+        return
+    sid = current(message.from_user.id)['id']
+    snapshot = db.scene_snapshot(sid)
+    if not snapshot:
+        await message.answer('Снимок сцены пока пуст. Он наполняется после игровых ходов. '
+                             'Для уже сыгранной истории используй /syncscene 12.')
+    else:
+        await send_long(message, snapshot + '\n\nЕсли нужна авторская поправка — '
+                        '/setscene location | На корабле в море. '
+                        'Ручная поправка закрепляется, пока её не снимешь командой /clearscene.')
+
+
+@router.message(Command('setscene'))
+async def cmd_set_scene(message: Message, command: CommandObject):
+    if not await ensure_access(message): return
+    parts = (command.args or '').split('|',1)
+    if len(parts) != 2:
+        await message.answer('Пример: /setscene location | На корабле в открытом море\n'
+                             'Допустимые поля: location, travel, destination, time, threat.')
+        return
+    key, value = parts[0].strip().lower(), parts[1].strip()
+    try:
+        db.set_scene_override(current(message.from_user.id)['id'], 'scene', '', key, value)
+    except ValueError as exc:
+        await message.answer(str(exc)); return
+    await message.answer('Закреплено в текущей сцене. Просмотр: /scene. '
+                         'Снять ручное закрепление: /clearscene ' + key)
+
+
+@router.message(Command('clearscene'))
+async def cmd_clear_scene(message: Message, command: CommandObject):
+    if not await ensure_access(message): return
+    from continuity import SCENE_ASPECTS
+    field = (command.args or '').strip().lower()
+    if field not in SCENE_ASPECTS:
+        await message.answer('Укажи поле: /clearscene location (или travel/destination/time/threat).'); return
+    db.clear_scene_override(current(message.from_user.id)['id'], 'scene', '', field)
+    await message.answer('Ручное закрепление снято. Следующие игровые события смогут обновлять это поле.')
+
+
+@router.message(Command('setcharstate'))
+async def cmd_set_char_state(message: Message, command: CommandObject):
+    if not await ensure_access(message): return
+    parts = [s.strip() for s in (command.args or '').split('|',2)]
+    if len(parts)!=3:
+        await message.answer('Пример: /setcharstate Авинель | vision | Нормальное зрение после помощи Кирай\n'
+                             'Поля: vision, pain, injury, mark, condition, status, '
+                             'ability, location, equipment, goal, intent, allegiance.')
+        return
+    try:
+        db.set_scene_override(current(message.from_user.id)['id'], 'character', *parts)
+    except ValueError as exc:
+        await message.answer(str(exc)); return
+    await message.answer('Уточнение закреплено. Просмотр: /scene. '
+                         'Снять: /clearcharstate ' + parts[0] + ' | ' + parts[1])
+
+
+@router.message(Command('clearcharstate'))
+async def cmd_clear_char_state(message: Message, command: CommandObject):
+    if not await ensure_access(message): return
+    parts = [s.strip() for s in (command.args or '').split('|',1)]
+    if len(parts)!=2:
+        await message.answer('Пример: /clearcharstate Авинель | vision'); return
+    sid=current(message.from_user.id)['id']
+    try:
+        names={c['name'].casefold():c['name'] for c in db.list_characters(sid)}
+        name=names.get(parts[0].casefold())
+        from continuity import CHARACTER_ASPECTS
+        if name is None or parts[1] not in CHARACTER_ASPECTS: raise ValueError
+    except ValueError:
+        await message.answer('Неизвестное имя или поле. Смотри /scene и список героев.'); return
+    db.clear_scene_override(sid,'character',name,parts[1])
+    await message.answer('Ручное закрепление снято.')
+
+
+@router.message(Command('syncscene'))
+async def cmd_sync_scene(message: Message, command: CommandObject):
+    if not await ensure_access(message): return
+    try:
+        limit = int((command.args or '12').strip())
+        if not 1 <= limit <= 20: raise ValueError
+    except ValueError:
+        await message.answer('Использование: /syncscene 12 (1–20 последних ходов).'); return
+    if story_lock.locked():
+        await message.answer('Идёт генерация. Повтори после её окончания.'); return
+    async with story_lock:
+        sid = current(message.from_user.id)['id']
+        note = await message.answer('Сверяю последние события с актуальным состоянием… (один запрос памяти).')
+        try:
+            async with typing_during(message.bot, message.chat.id):
+                n = await engine.rebuild_scene_snapshot(sid, limit)
+            result = (f'Обновлено полей: {n}.\n\n' +
+                      (db.scene_snapshot(sid) or 'Новых подтверждённых состояний не найдено.'))
+        except Exception:
+            log.exception('Scene snapshot sync failed')
+            result = ('Не удалось восстановить состояние: база и игровая история не изменены. '
+                      'Проверь лог BotHost и модель памяти.')
+        await send_long(message, result)
+        try: await note.delete()
+        except Exception: pass
 
 
 @router.message(Command('remember'))
@@ -598,6 +706,8 @@ async def main():
             BotCommand(command='model', description='Модель художественного текста'),
             BotCommand(command='memoryhealth', description='Проверить память истории'),
             BotCommand(command='syncmemory', description='Восстановить память по ходам'),
+            BotCommand(command='scene', description='Где герои и что с ними сейчас'),
+            BotCommand(command='syncscene', description='Сверить текущую сцену по истории'),
             BotCommand(command='backup', description='Скачать копию базы'),
             BotCommand(command='cancelsetup', description='Отменить подготовку истории'),
             BotCommand(command='help', description='Справка'),

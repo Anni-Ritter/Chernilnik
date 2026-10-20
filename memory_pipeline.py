@@ -18,6 +18,10 @@ def parse_payload(text: str) -> dict:
     if not isinstance(payload, dict) or any(not isinstance(payload.get(k), list)
                                             for k in ('facts','world_changes','character_insights')):
         raise ValueError('Модель памяти вернула неполную структуру JSON')
+    if 'scene_updates' not in payload:
+        payload['scene_updates'] = []  # Legacy-compatible model response.
+    if not isinstance(payload['scene_updates'], list):
+        raise ValueError('Модель памяти вернула неправильный scene_updates')
     return payload
 
 
