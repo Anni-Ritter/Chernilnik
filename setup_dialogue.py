@@ -7,8 +7,13 @@ from __future__ import annotations
 
 import re
 
-SETUP_MAX_TOKENS = 2200
-SETUP_RETRY_MAX_TOKENS = 4800
+from generation_continuation import (
+    CONTINUATION_PROMPT, automatic_continuations, followup_token_budget,
+    reached_limit, append_continuation,
+)
+
+SETUP_MAX_TOKENS = 4096
+SETUP_RETRY_MAX_TOKENS = 8192
 TELEGRAM_SAFE_CHUNK = 3800
 
 DIALOGUE_SYSTEM = '''Ты Чернильник — живой, внимательный ИИ-соавтор, с которым автор ОБСУЖДАЕТ будущую текстовую ролевую, прежде чем начать игру.
@@ -163,36 +168,45 @@ def split_telegram_text(text: str, limit: int = TELEGRAM_SAFE_CHUNK) -> list[str
 
 
 def _ran_out_of_tokens(response, *, polza: bool) -> bool:
-    if polza:
-        choices = getattr(response, 'choices', None) or []
-        reason = getattr(choices[0], 'finish_reason', None) if choices else None
-        return str(reason).lower() in ('length', 'max_tokens', 'max_output_tokens', 'max_tokens_exceeded')
-    status = str(getattr(response, 'status', '')).lower()
-    details = getattr(response, 'incomplete_details', None)
-    reason = str(getattr(details, 'reason', '')).lower()
-    return status == 'incomplete' or reason == 'max_output_tokens'
+    """Backward compatible alias for diagnostics and previous tests."""
+    return reached_limit(response, polza=polza)
 
 
 async def generate_setup_reply(engine, db, draft: dict, latest: str, *, is_photo: bool = False) -> str:
-    """Natural setup chat: regenerate on token exhaustion, never show fragments."""
+    """Complete a conversational reply; never send or save an incomplete fragment."""
     choice = engine.generation_choice()
     client = engine.polza_client if choice.provider == 'polza' else engine.client
     if client is None:
         raise RuntimeError('Selected model client is not configured.')
     messages = setup_dialogue_messages(db, draft, latest, is_photo=is_photo)
-    for budget in (SETUP_MAX_TOKENS, SETUP_RETRY_MAX_TOKENS):
+    result = ''
+    initial = SETUP_MAX_TOKENS
+    for attempt in range(automatic_continuations() + 1):
+        budget = initial if attempt == 0 else max(SETUP_RETRY_MAX_TOKENS, followup_token_budget(initial))
         if choice.provider == 'polza':
+            sent = list(messages)
+            if result:
+                sent += [{'role': 'assistant', 'content': result},
+                         {'role': 'user', 'content': CONTINUATION_PROMPT}]
             response = await client.chat.completions.create(
-                model=choice.model, messages=messages, max_tokens=budget)
+                model=choice.model, messages=sent, max_tokens=budget)
             reply = response.choices[0].message.content if response.choices else None
         else:
+            input_data = messages[1]['content']
+            if result:
+                input_data = [
+                    {'role': 'user', 'content': messages[1]['content']},
+                    {'role': 'assistant', 'content': result},
+                    {'role': 'user', 'content': CONTINUATION_PROMPT},
+                ]
             response = await client.responses.create(
                 model=choice.model, instructions=messages[0]['content'],
-                input=messages[1]['content'], max_output_tokens=budget, store=False)
+                input=input_data, max_output_tokens=budget, store=False)
             reply = response.output_text
-        if _ran_out_of_tokens(response, polza=choice.provider == 'polza'):
-            continue
-        if not isinstance(reply, str) or not reply.strip():
-            raise RuntimeError('Selected model returned an empty setup response.')
-        return reply.strip()
+        if isinstance(reply, str) and reply.strip():
+            result = append_continuation(result, reply)
+        if not reached_limit(response, polza=choice.provider == 'polza'):
+            if not result.strip():
+                raise RuntimeError('Selected model returned an empty setup response.')
+            return result.strip()
     raise RuntimeError('Selected model repeatedly hit the setup output-token limit.')

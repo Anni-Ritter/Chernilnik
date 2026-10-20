@@ -12,20 +12,24 @@ from prompting import PromptComposer
 from memory import EXTRACT_INSTRUCTIONS, extraction_prompt, select_memories, validated_extractions, save_extractions
 from generation_models import GenerationChoice, GenerationSettings
 from worlds import PROFILE_FIELDS
+from generation_continuation import (
+    CONTINUATION_PROMPT, automatic_continuations, followup_token_budget,
+    reached_limit, message_text, append_continuation,
+)
 
 log = logging.getLogger(__name__)
 
 
 class RoleplayEngine:
     def __init__(self, store: Store, client: AsyncOpenAI, model: str, memory_model: str,
-                 auto_memory: bool = True, max_output_tokens: int = 1800):
+                 auto_memory: bool = True, max_output_tokens: int = 8192):
         self.db, self.client = store, client
         self.model, self.memory_model = model, memory_model
         self.generation_settings: GenerationSettings | None = None
         self.polza_client: AsyncOpenAI | None = None
         self.last_generation_model = model
         self.auto_memory = auto_memory
-        self.max_output_tokens = max_output_tokens
+        self.max_output_tokens = max(1, int(max_output_tokens))
         self.debug_prompts = os.getenv('PROMPT_DEBUG', 'true').lower() in ('true','1','yes','on')
         self.composer = PromptComposer(
             store, self.character_context,
@@ -100,44 +104,72 @@ class RoleplayEngine:
         if self.debug_prompts:
             self.db.save_prompt_audit(sid, 'opening' if opening else 'turn',
                                       choice.display(), compiled.preview())
-        if choice.provider == 'polza':
-            if self.polza_client is None:
-                raise RuntimeError('Для Polza API нужно задать POLZA_API_KEY на BotHost.')
-            # Polza implements OpenAI-compatible Chat Completions, NOT Responses API.
-            response = await self.polza_client.chat.completions.create(
-                model=choice.model,
-                messages=[{'role': 'system', 'content': compiled.system},
-                          {'role': 'user', 'content': compiled.user}],
-                max_tokens=self.max_output_tokens,
-            )
-            content = response.choices[0].message.content if response.choices else None
-            if isinstance(content, str):
-                answer = content.strip()
-            elif isinstance(content, list):
-                answer = '\n'.join(piece.get('text', '') if isinstance(piece, dict)
-                                   else getattr(piece, 'text', '') or '' for piece in content).strip()
+
+        is_polza = choice.provider == 'polza'
+        if is_polza and self.polza_client is None:
+            raise RuntimeError('Для Polza API нужно задать POLZA_API_KEY на BotHost.')
+        max_followups = automatic_continuations()
+        answer = ''
+        total_input = total_output = 0
+        budget = self.max_output_tokens
+
+        for attempt in range(max_followups + 1):
+            # A continuation is an extension of this SAME answer, never a new story turn.
+            # Include the already generated text as assistant context, with instructions
+            # to output only the missing suffix. No partial draft touches the SQLite DB.
+            if is_polza:
+                messages = [{'role': 'system', 'content': compiled.system},
+                            {'role': 'user', 'content': compiled.user}]
+                if answer:
+                    messages += [
+                        {'role': 'assistant', 'content': answer},
+                        {'role': 'user', 'content': CONTINUATION_PROMPT},
+                    ]
+                response = await self.polza_client.chat.completions.create(
+                    model=choice.model, messages=messages, max_tokens=budget)
+                choice0 = response.choices[0] if response.choices else None
+                piece = message_text(choice0.message.content) if choice0 else ''
+                usage = getattr(response, 'usage', None)
+                inp = getattr(usage, 'prompt_tokens', 0) or 0
+                out = getattr(usage, 'completion_tokens', 0) or 0
             else:
-                answer = ''
-            usage = getattr(response, 'usage', None)
-            inp = getattr(usage, 'prompt_tokens', 0) or 0
-            out = getattr(usage, 'completion_tokens', 0) or 0
-        else:
-            # Old OpenAI Responses API behavior stays intact, including no server-side storage.
-            response = await self.client.responses.create(
-                model=choice.model,
-                instructions=compiled.system,
-                input=compiled.user,
-                max_output_tokens=self.max_output_tokens,
-                store=False,
-            )
-            answer = (response.output_text or '').strip()
-            usage = getattr(response, 'usage', None)
-            inp = getattr(usage, 'input_tokens', 0) or 0
-            out = getattr(usage, 'output_tokens', 0) or 0
-        if not answer:
-            raise RuntimeError('Модель не вернула художественный текст. Проверь ключ, ID модели и лимит токенов.')
-        self.last_generation_model = choice.model
-        return answer, inp, out
+                # No OpenAI Responses server-side storage; followups reconstruct
+                # context client-side from the prior partial answer.
+                input_data = compiled.user
+                if answer:
+                    input_data = [
+                        {'role': 'user', 'content': compiled.user},
+                        {'role': 'assistant', 'content': answer},
+                        {'role': 'user', 'content': CONTINUATION_PROMPT},
+                    ]
+                response = await self.client.responses.create(
+                    model=choice.model, instructions=compiled.system,
+                    input=input_data, max_output_tokens=budget, store=False)
+                piece = getattr(response, 'output_text', '') or ''
+                usage = getattr(response, 'usage', None)
+                inp = getattr(usage, 'input_tokens', 0) or 0
+                out = getattr(usage, 'output_tokens', 0) or 0
+
+            total_input += inp
+            total_output += out
+            if piece and not piece.isspace():
+                answer = append_continuation(answer, piece)
+            truncated = reached_limit(response, polza=is_polza)
+            if not truncated:
+                if not answer.strip():
+                    raise RuntimeError('Модель не вернула художественный текст. Проверь ключ, ID модели и лимит токенов.')
+                self.last_generation_model = choice.model
+                return answer.strip(), total_input, total_output
+
+            if attempt == max_followups:
+                raise RuntimeError(
+                    'Модель не завершила ответ даже после автоматических продолжений. '
+                    'Пост не сохранён; проверь лимиты модели и GENERATION_AUTO_CONTINUES.')
+            log.info('Model %s hit output token limit in story %s; auto-continue %d/%d',
+                     choice.model, sid, attempt + 1, max_followups)
+            budget = followup_token_budget(self.max_output_tokens)
+
+        raise RuntimeError('Unexpected literary completion state.')
 
     async def generate_opening(self, sid: int):
         return await self._call(sid, post=None, opening=True)

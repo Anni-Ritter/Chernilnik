@@ -33,7 +33,7 @@ MEMORY_MODEL = os.getenv('MEMORY_MODEL', 'gpt-6-luna')
 DB_PATH = resolve_database_path(allow_new=os.getenv('ALLOW_NEW_DATABASE', '').lower() in ('1', 'true', 'yes'))
 log.info('Using SQLite database: %s', DB_PATH)
 AUTO_MEMORY = os.getenv('AUTO_MEMORY', 'true').lower() in ('1', 'true', 'yes', 'on')
-MAX_OUTPUT = int(os.getenv('MAX_OUTPUT_TOKENS', '1800'))
+MAX_OUTPUT = int(os.getenv('MAX_OUTPUT_TOKENS', '8192'))
 
 router = Router()
 db = Store(DB_PATH)

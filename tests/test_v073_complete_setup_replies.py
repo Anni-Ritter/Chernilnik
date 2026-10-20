@@ -22,18 +22,19 @@ def make_polza_engine(client):
 
 
 @pytest.mark.asyncio
-async def test_regenerates_instead_of_sending_truncated_polza_reply(empty_store):
+async def test_continues_instead_of_sending_truncated_polza_reply(empty_store):
     class Replies:
         def __init__(self): self.calls=[]
         async def create(self, **kwargs):
             self.calls.append(kwargs)
             if len(self.calls) == 1:
                 return fake_polza('A dangerously unfin', 'length')
-            return fake_polza('A fully completed sentence.', 'stop')
+            return fake_polza('ished sentence.', 'stop')
     replies=Replies()
     text = await generate_setup_reply(make_polza_engine(replies), empty_store,
                                       {'notes':['test'], 'world_id':0, 'photos':[]}, 'test')
-    assert text == 'A fully completed sentence.'
+    assert text == 'A dangerously unfinished sentence.'
+    assert replies.calls[1]['messages'][-2]['role'] == 'assistant'
     assert [r['max_tokens'] for r in replies.calls] == [SETUP_MAX_TOKENS, SETUP_RETRY_MAX_TOKENS]
 
 
@@ -58,14 +59,15 @@ async def test_openai_incomplete_is_retried(empty_store):
                    incomplete_details=SimpleNamespace(reason='max_output_tokens'),
                    output_text='Some unfinished')
             return SimpleNamespace(status='completed', incomplete_details=None,
-                                   output_text='Some finished prose.')
+                                   output_text=' response.')
     replies=Replies()
     engine=SimpleNamespace(
         generation_choice=lambda: SimpleNamespace(provider='openai', model='test'),
         client=SimpleNamespace(responses=replies), polza_client=None)
     result=await generate_setup_reply(engine, empty_store,
                    {'notes':[], 'world_id':0, 'photos':[]}, 'test')
-    assert result == 'Some finished prose.'
+    assert result == 'Some unfinished response.'
+    assert replies.calls[1]['input'][-2]['role'] == 'assistant'
     assert replies.calls[1]['max_output_tokens'] == SETUP_RETRY_MAX_TOKENS
 
 
